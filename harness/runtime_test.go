@@ -16,7 +16,9 @@ type scriptedModels struct {
 
 type retryModels struct {
 	mu         sync.Mutex
+	model      Model
 	outcomes   []retryOutcome
+	requests   [][]Message
 	resolveErr error
 	calls      int
 	cancelled  int
@@ -93,10 +95,13 @@ func (m *retryModels) Resolve(context.Context, string, string) (Model, error) {
 	if m.resolveErr != nil {
 		return Model{}, m.resolveErr
 	}
+	if m.model.Provider != "" {
+		return m.model, nil
+	}
 	return Model{Provider: "provider", ModelID: "model"}, nil
 }
 
-func (m *retryModels) Stream(_ context.Context, _ Model, _ []Message, _ AgentHarnessStreamOptions) (<-chan AgentEvent, error) {
+func (m *retryModels) Stream(_ context.Context, _ Model, messages []Message, _ AgentHarnessStreamOptions) (<-chan AgentEvent, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.calls++
@@ -105,6 +110,7 @@ func (m *retryModels) Stream(_ context.Context, _ Model, _ []Message, _ AgentHar
 		return nil, fmt.Errorf("unexpected provider call %d", m.calls)
 	}
 	outcome := m.outcomes[index]
+	m.requests = append(m.requests, append([]Message(nil), messages...))
 	if outcome.err != nil {
 		return nil, outcome.err
 	}
