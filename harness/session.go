@@ -165,6 +165,9 @@ func (s *MemorySession) Commit(ctx context.Context, tx Transaction) (CommitResul
 func (s *MemorySession) GetEntries(ctx context.Context, ids []string) (map[string]Entry, error) {
 	return s.storage.GetEntries(ctx, ids)
 }
+func (s *MemorySession) ScanUsage(ctx context.Context, query UsageScan) ([]UsageRow, error) {
+	return s.storage.ScanUsage(ctx, query)
+}
 func (s *MemorySession) GetRegister(ctx context.Context, namespace RegisterNamespace, key string) (*Register, error) {
 	return s.storage.GetRegister(ctx, namespace, key)
 }

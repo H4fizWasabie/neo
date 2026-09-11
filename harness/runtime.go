@@ -120,6 +120,12 @@ func NewHarness(ctx context.Context, options AgentHarnessOptions) (*Harness, []S
 		rootCtx:            rootCtx,
 		cancel:             cancel,
 	}
+	if options.Telemetry != nil {
+		h.session = &telemetrySession{Session: options.Session, telemetry: options.Telemetry}
+	}
+	h.hooks.onError = func(invocation HookInvocation, handlerID string, cause any) {
+		h.events.Emit(context.Background(), HarnessEvent{Type: string(EventHandlerError), Lane: invocation.Lane, Payload: map[string]JSONValue{"error": fmt.Sprint(cause), "hook": string(invocation.Name), "handler": handlerID}})
+	}
 	h.lifecycle.done = make(chan struct{})
 	main, err := h.attachLane(ctx, "main", options)
 	if err != nil {
@@ -262,6 +268,14 @@ func (h *Harness) operationSpan(ctx context.Context, name, lane, operationID str
 	})
 }
 
+func (h *Harness) fault(err error) error {
+	if err == nil {
+		return nil
+	}
+	h.events.Emit(context.Background(), HarnessEvent{Type: string(EventFault), Payload: map[string]JSONValue{"code": "runtime", "message": err.Error()}})
+	return h.lifecycle.Fault(err)
+}
+
 func actionSpanName(kind string) string {
 	switch kind {
 	case "provider":
@@ -302,6 +316,38 @@ func (l *runtimeLane) Session() SessionTree { return &laneTree{SessionTree: l.vi
 type laneTree struct {
 	SessionTree
 	lane *runtimeLane
+}
+
+func (t *laneTree) SetName(ctx context.Context, name *string) error {
+	if err := t.SessionTree.SetName(ctx, name); err != nil {
+		return err
+	}
+	t.lane.harness.events.Emit(ctx, HarnessEvent{Type: string(EventFactUpdate), Payload: map[string]JSONValue{"fact": "name", "name": cloneStringPointer(name)}})
+	return nil
+}
+
+func (t *laneTree) SetLabel(ctx context.Context, id string, label *string) error {
+	if err := t.SessionTree.SetLabel(ctx, id, label); err != nil {
+		return err
+	}
+	t.lane.harness.events.Emit(ctx, HarnessEvent{Type: string(EventFactUpdate), Payload: map[string]JSONValue{"fact": "label", "targetId": id, "label": cloneStringPointer(label)}})
+	return nil
+}
+
+func (t *laneTree) SetCustomFact(ctx context.Context, key string, value JSONValue) error {
+	if err := t.SessionTree.SetCustomFact(ctx, key, value); err != nil {
+		return err
+	}
+	t.lane.harness.events.Emit(ctx, HarnessEvent{Type: string(EventFactUpdate), Payload: map[string]JSONValue{"fact": "custom", "key": key, "value": cloneValue(value)}})
+	return nil
+}
+
+func (t *laneTree) DeleteCustomFact(ctx context.Context, key string) error {
+	if err := t.SessionTree.DeleteCustomFact(ctx, key); err != nil {
+		return err
+	}
+	t.lane.harness.events.Emit(ctx, HarnessEvent{Type: string(EventFactUpdate), Payload: map[string]JSONValue{"fact": "custom", "key": key}})
+	return nil
 }
 
 func (t *laneTree) AppendMessage(ctx context.Context, message AgentMessage) (string, error) {
@@ -579,6 +625,7 @@ func (l *runtimeLane) Prompt(ctx context.Context, input PromptInput) (Result[Run
 	}
 	if result.Kind == "suspended" {
 		l.setSuspension(SuspendedOperation{Lane: l.name, OperationID: operationID, Kind: OperationRun, Reason: result.Reason, StartedAt: accepted.StartedAt, Deferred: result.Deferred})
+		l.harness.events.Emit(ctx, HarnessEvent{Type: string(EventRunSuspend), Lane: l.name, Payload: map[string]JSONValue{"runId": operationID, "reason": result.Reason, "deferred": result.Deferred}})
 	}
 	return Ok[RunOutcome, error](result), nil
 }
@@ -909,7 +956,7 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 			return h.settleGenerationError(ctx, lane, operation, current, *pending.Run.Phase.Generation, terminalGenerationError{err})
 		}
 		if message.StopReason == StopReasonAborted {
-			return RunOutcome{}, h.lifecycle.Fault(fmt.Errorf("provider returned aborted while control is running"))
+			return RunOutcome{}, h.fault(fmt.Errorf("provider returned aborted while control is running"))
 		}
 		if message.StopReason == StopReasonError {
 			if overflow, reason := overflowMessage(message, *pending.Run.Phase.Generation); overflow {
@@ -1141,7 +1188,7 @@ func (h *Harness) driveDeferred(ctx context.Context, lane *runtimeLane, operatio
 		return h.settleDeferredError(ctx, lane, operation, current, generation, err)
 	}
 	if message.StopReason == StopReasonAborted {
-		return RunOutcome{}, h.lifecycle.Fault(fmt.Errorf("provider returned aborted while control is running"))
+		return RunOutcome{}, h.fault(fmt.Errorf("provider returned aborted while control is running"))
 	}
 	if message.StopReason == StopReasonError {
 		return h.settleDeferredError(ctx, lane, operation, current, generation, fmt.Errorf("provider returned an error"))
@@ -1604,6 +1651,19 @@ func (h *Harness) finishCompaction(ctx context.Context, lane *runtimeLane, opera
 }
 
 func (h *Harness) runDeferredPoll(ctx context.Context, lane *runtimeLane, operation Operation, deferred Deferred, handle DeferredHandle, options AgentHarnessStreamOptions, fx *runtimeEffects, turnID string) (DeferredResponse, error) {
+	if h.telemetry == nil {
+		return h.runDeferredPollRaw(ctx, lane, operation, deferred, handle, options, fx, turnID)
+	}
+	var response DeferredResponse
+	err := h.telemetry.StartSpan(ctx, SpanOptions{Name: SpanHarnessTurn, Attributes: map[string]AttributeValue{"lane": lane.name, "operation.id": operation.OperationID, "step.id": turnID}}, func(TelemetrySpan) error {
+		var err error
+		response, err = h.runDeferredPollRaw(ctx, lane, operation, deferred, handle, options, fx, turnID)
+		return err
+	})
+	return response, err
+}
+
+func (h *Harness) runDeferredPollRaw(ctx context.Context, lane *runtimeLane, operation Operation, deferred Deferred, handle DeferredHandle, options AgentHarnessStreamOptions, fx *runtimeEffects, turnID string) (DeferredResponse, error) {
 	if err := h.effect(ctx, ActionInfo{Kind: "hook", Description: "before_payload"}, func(ctx context.Context) error {
 		_, err := fx.Run(ctx, EffectPlan{Kind: EffectHook, Key: EffectKey(fmt.Sprintf("%s:deferred:%d:before_payload", operation.OperationID, deferred.Poll)), HookName: HookBeforePayload, Event: map[string]JSONValue{"model": deferred.Configuration.Model, "payload": JSONValue("provider-request"), "turnId": turnID, "deferred": true}})
 		return err
@@ -1867,7 +1927,11 @@ func (h *Harness) settleRunCompactionResult(ctx context.Context, lane *runtimeLa
 	current.State = next
 	current.LeafID = stringPointer(id)
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventEntryAdded), Lane: lane.name, Payload: cloneValue(entry)})
-	h.events.Emit(ctx, HarnessEvent{Type: string(EventUsage), Lane: lane.name, Payload: cloneValue(usageValue(result.Usage))})
+	usageID := ""
+	if request != nil {
+		usageID = request.UsageID
+	}
+	h.emitUsage(ctx, lane.name, usageID, id, usageValue(result.Usage))
 	return h.drive(ctx, lane, operation, next)
 }
 
@@ -2052,6 +2116,20 @@ func (h *Harness) runBeforeRequestStep(ctx context.Context, fx *runtimeEffects, 
 }
 
 func (h *Harness) consumeCheckpointInput(ctx context.Context, lane *runtimeLane, current CurrentOperation) (bool, CurrentOperation, error) {
+	if h.telemetry == nil {
+		return h.consumeCheckpointInputRaw(ctx, lane, current)
+	}
+	var consumed bool
+	var next CurrentOperation
+	err := h.telemetry.StartSpan(ctx, SpanOptions{Name: SpanHarnessCheckpoint, Attributes: map[string]AttributeValue{"lane": lane.name, "operation.id": current.Operation.OperationID}}, func(TelemetrySpan) error {
+		var err error
+		consumed, next, err = h.consumeCheckpointInputRaw(ctx, lane, current)
+		return err
+	})
+	return consumed, next, err
+}
+
+func (h *Harness) consumeCheckpointInputRaw(ctx context.Context, lane *runtimeLane, current CurrentOperation) (bool, CurrentOperation, error) {
 	if current.State.Run == nil || current.State.Run.Phase.Checkpoint == nil {
 		return false, current, nil
 	}
@@ -2624,7 +2702,7 @@ func (h *Harness) settleTool(ctx context.Context, lane *runtimeLane, operation O
 	}
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventToolEnd), Lane: lane.name, Payload: cloneValue(result)})
 	if result.Usage != nil {
-		h.events.Emit(ctx, HarnessEvent{Type: string(EventUsage), Lane: lane.name, Payload: cloneValue(*result.Usage)})
+		h.emitUsage(ctx, lane.name, "", call.ResultEntryID, *result.Usage)
 	}
 	if settlement.Current.State.Run.Phase.Kind == PhaseCheckpoint {
 		if settlement.Current.State.Run.Phase.Checkpoint.Continuation.Kind == ContinuationMayFinish {
@@ -2636,6 +2714,23 @@ func (h *Harness) settleTool(ctx context.Context, lane *runtimeLane, operation O
 }
 
 func (h *Harness) runAssistantAttempt(ctx context.Context, lane *runtimeLane, operation Operation, pending OperationState, leaf *string, fx *runtimeEffects) (AgentMessage, error) {
+	if h.telemetry == nil {
+		return h.runAssistantAttemptRaw(ctx, lane, operation, pending, leaf, fx)
+	}
+	stepID := ""
+	if pending.Run != nil && pending.Run.Phase.Generation != nil {
+		stepID = pending.Run.Phase.Generation.Context.StepID
+	}
+	var message AgentMessage
+	err := h.telemetry.StartSpan(ctx, SpanOptions{Name: SpanHarnessTurn, Attributes: map[string]AttributeValue{"lane": lane.name, "operation.id": operation.OperationID, "step.id": stepID}}, func(TelemetrySpan) error {
+		var err error
+		message, err = h.runAssistantAttemptRaw(ctx, lane, operation, pending, leaf, fx)
+		return err
+	})
+	return message, err
+}
+
+func (h *Harness) runAssistantAttemptRaw(ctx context.Context, lane *runtimeLane, operation Operation, pending OperationState, leaf *string, fx *runtimeEffects) (AgentMessage, error) {
 	generation := pending.Run.Phase.Generation
 	message := AgentMessage{Role: "assistant"}
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventMessageStart), Lane: lane.name, Payload: cloneValue(message)})
@@ -3803,6 +3898,7 @@ func (l *runtimeLane) Resume(ctx context.Context) (Result[ResumeOutcome, error],
 			missing = &MissingIdentitySuspension{Reason: outcome.Reason}
 		}
 		l.setSuspension(SuspendedOperation{Lane: l.name, OperationID: current.Operation.OperationID, Kind: OperationRun, Reason: outcome.Reason, StartedAt: current.Operation.StartedAt, MissingTools: missing.Tools, MissingModels: missing.Models})
+		l.harness.events.Emit(ctx, HarnessEvent{Type: string(EventRunSuspend), Lane: l.name, Payload: map[string]JSONValue{"runId": current.Operation.OperationID, "reason": outcome.Reason, "missing": map[string]JSONValue{"tools": missing.Tools, "models": missing.Models}}})
 		if missing := l.missingIdentities(ctx, current.Configuration); missing != nil {
 			return Result[ResumeOutcome, error]{Err: missing}, nil
 		}
@@ -4023,8 +4119,49 @@ func (l *runtimeLane) RecordUsage(ctx context.Context, usage Usage, entryID *str
 	}); err != nil {
 		return Result[RecordUsageOutcome, error]{Err: err}, nil
 	}
-	l.harness.events.Emit(ctx, HarnessEvent{Type: string(EventUsage), Lane: l.name, Payload: usage})
+	entry := ""
+	if entryID != nil {
+		entry = *entryID
+	}
+	l.harness.emitUsage(ctx, l.name, id, entry, usage)
 	return Ok[RecordUsageOutcome, error](RecordUsageOutcome{UsageID: id}), nil
+}
+
+func (h *Harness) emitUsage(ctx context.Context, lane, usageID, entryID string, fallback Usage) {
+	row := UsageRow{ID: usageID, Usage: fallback, EntryID: cloneStringPointer(&entryID)}
+	if entryID == "" {
+		row.EntryID = nil
+	}
+	if rows, err := h.session.ScanUsage(ctx, UsageScan{Order: NewestFirst}); err == nil {
+		for _, candidate := range rows {
+			if (usageID != "" && candidate.ID == usageID) || (usageID == "" && entryID != "" && candidate.EntryID != nil && *candidate.EntryID == entryID) {
+				row = candidate
+				break
+			}
+		}
+	}
+	totals := Usage{}
+	if rows, err := h.session.ScanUsage(ctx, UsageScan{Order: OldestFirst}); err == nil {
+		for _, candidate := range rows {
+			totals.Input += candidate.Usage.Input
+			totals.Output += candidate.Usage.Output
+			totals.CacheRead += candidate.Usage.CacheRead
+			totals.CacheWrite += candidate.Usage.CacheWrite
+			totals.Reasoning += candidate.Usage.Reasoning
+			totals.Total += candidate.Usage.Total
+			if candidate.Usage.Cost != nil {
+				if totals.Cost == nil {
+					totals.Cost = &Cost{}
+				}
+				totals.Cost.Input += candidate.Usage.Cost.Input
+				totals.Cost.Output += candidate.Usage.Cost.Output
+				totals.Cost.CacheRead += candidate.Usage.Cost.CacheRead
+				totals.Cost.CacheWrite += candidate.Usage.Cost.CacheWrite
+				totals.Cost.Total += candidate.Usage.Cost.Total
+			}
+		}
+	}
+	h.events.Emit(ctx, HarnessEvent{Type: string(EventUsage), Payload: map[string]JSONValue{"lane": lane, "row": row, "totals": totals}})
 }
 func (l *runtimeLane) begin() {
 	l.mu.Lock()
@@ -4112,8 +4249,13 @@ func (l *runtimeLane) SetModel(ctx context.Context, model Model) error {
 	if err != nil {
 		return err
 	}
+	previous := config.Model
 	config.Model = model
-	return l.setConfiguration(ctx, config)
+	if err := l.setConfiguration(ctx, config); err != nil {
+		return err
+	}
+	l.harness.events.Emit(ctx, HarnessEvent{Type: string(EventConfigUpdate), Lane: l.name, Payload: map[string]JSONValue{"property": "model", "value": model, "previous": previous}})
+	return nil
 }
 func (l *runtimeLane) GetThinkingLevel(ctx context.Context) (ThinkingLevel, error) {
 	config, err := l.configuration(ctx)
@@ -4124,8 +4266,13 @@ func (l *runtimeLane) SetThinkingLevel(ctx context.Context, level ThinkingLevel)
 	if err != nil {
 		return err
 	}
+	previous := config.ThinkingLevel
 	config.ThinkingLevel = level
-	return l.setConfiguration(ctx, config)
+	if err := l.setConfiguration(ctx, config); err != nil {
+		return err
+	}
+	l.harness.events.Emit(ctx, HarnessEvent{Type: string(EventConfigUpdate), Lane: l.name, Payload: map[string]JSONValue{"property": "thinkingLevel", "value": level, "previous": previous}})
+	return nil
 }
 func (l *runtimeLane) GetActiveTools(ctx context.Context) ([]string, error) {
 	config, err := l.configuration(ctx)
@@ -4136,8 +4283,13 @@ func (l *runtimeLane) SetActiveTools(ctx context.Context, names []string) error 
 	if err != nil {
 		return err
 	}
+	previous := append([]string(nil), config.ActiveToolNames...)
 	config.ActiveToolNames = append([]string(nil), names...)
-	return l.setConfiguration(ctx, config)
+	if err := l.setConfiguration(ctx, config); err != nil {
+		return err
+	}
+	l.harness.events.Emit(ctx, HarnessEvent{Type: string(EventConfigUpdate), Lane: l.name, Payload: map[string]JSONValue{"property": "activeTools", "value": append([]string(nil), names...), "previous": previous}})
+	return nil
 }
 func (l *runtimeLane) configuration(ctx context.Context) (LaneConfiguration, error) {
 	register, err := l.harness.session.GetRegister(ctx, RegisterLaneConfig, l.name)
@@ -4396,6 +4548,7 @@ func (h *Harness) SetTools(ctx context.Context, tools []AgentHarnessTool) error 
 	h.configurationMu.Lock()
 	h.tools = append([]AgentHarnessTool(nil), tools...)
 	h.configurationMu.Unlock()
+	h.events.Emit(ctx, HarnessEvent{Type: string(EventConfigUpdate), Payload: map[string]JSONValue{"property": "tools"}})
 	return nil
 }
 func (h *Harness) GetResources(context.Context) (Resources, error) {
@@ -4410,13 +4563,19 @@ func (h *Harness) SetResources(ctx context.Context, resources Resources) error {
 	h.configurationMu.Lock()
 	h.resources = cloneValue(resources).(Resources)
 	h.configurationMu.Unlock()
+	h.events.Emit(ctx, HarnessEvent{Type: string(EventConfigUpdate), Payload: map[string]JSONValue{"property": "resources"}})
 	return nil
 }
 func (h *Harness) GetStreamOptions(context.Context) (AgentHarnessStreamOptions, error) {
 	return h.settings.Snapshot().StreamOptions, nil
 }
-func (h *Harness) SetStreamOptions(_ context.Context, options AgentHarnessStreamOptions) error {
+
+func (h *Harness) SetStreamOptions(ctx context.Context, options AgentHarnessStreamOptions) error {
+	if err := h.lifecycle.Err(); err != nil {
+		return err
+	}
 	h.settings.UpdateStream(options)
+	h.events.Emit(ctx, HarnessEvent{Type: string(EventConfigUpdate), Payload: map[string]JSONValue{"property": "streamOptions"}})
 	return nil
 }
 
@@ -4467,7 +4626,7 @@ func (h *Harness) settleGeneration(ctx context.Context, lane *runtimeLane, opera
 	}
 	settled := settlement.Current
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventEntryAdded), Lane: lane.name, Payload: cloneValue(entry)})
-	h.events.Emit(ctx, HarnessEvent{Type: string(EventUsage), Lane: lane.name, Payload: cloneValue(usage)})
+	h.emitUsage(ctx, lane.name, generation.UsageID, generation.ResponseEntryID, usage)
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventTurnEnd), Lane: lane.name, Payload: map[string]JSONValue{"runId": operation.OperationID, "turnId": generation.Context.StepID}})
 	return settled, nil
 }
@@ -4642,7 +4801,7 @@ func (h *Harness) settleGenerationOverflow(ctx context.Context, lane *runtimeLan
 		current.OperationStateSeq = commit.Seqs[len(commit.Seqs)-1]
 	}
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventEntryAdded), Lane: lane.name, Payload: cloneValue(entry)})
-	h.events.Emit(ctx, HarnessEvent{Type: string(EventUsage), Lane: lane.name, Payload: cloneValue(usageValue(message.Usage))})
+	h.emitUsage(ctx, lane.name, usageID, responseID, usageValue(message.Usage))
 	if hasPreparation {
 		return h.drive(ctx, lane, operation, next)
 	}
@@ -4836,7 +4995,7 @@ func (h *Harness) GetRetryPolicy(context.Context) (RetryPolicy, error) {
 	snapshot := h.settings.Snapshot()
 	return RetryPolicy{Enabled: snapshot.RetryPolicy.MaxAttempts > 1, MaxRetries: snapshot.RetryPolicy.MaxAttempts - 1, BaseDelayMs: snapshot.RetryPolicy.BaseDelayMs}, nil
 }
-func (h *Harness) SetRetryPolicy(_ context.Context, policy RetryPolicy) error {
+func (h *Harness) SetRetryPolicy(ctx context.Context, policy RetryPolicy) error {
 	if err := h.lifecycle.Err(); err != nil {
 		return err
 	}
@@ -4848,6 +5007,7 @@ func (h *Harness) SetRetryPolicy(_ context.Context, policy RetryPolicy) error {
 		maxAttempts = policy.MaxRetries + 1
 	}
 	h.settings.UpdateRetry(NormalizedRetryPolicy{MaxAttempts: maxAttempts, BaseDelayMs: policy.BaseDelayMs})
+	h.events.Emit(ctx, HarnessEvent{Type: string(EventConfigUpdate), Payload: map[string]JSONValue{"property": "retryPolicy"}})
 	return nil
 }
 func (h *Harness) GetCompactionSettings(context.Context) (CompactionSettings, error) {
@@ -4855,7 +5015,7 @@ func (h *Harness) GetCompactionSettings(context.Context) (CompactionSettings, er
 	defer h.configurationMu.RUnlock()
 	return h.compaction, nil
 }
-func (h *Harness) SetCompactionSettings(_ context.Context, settings CompactionSettings) error {
+func (h *Harness) SetCompactionSettings(ctx context.Context, settings CompactionSettings) error {
 	if err := h.lifecycle.Err(); err != nil {
 		return err
 	}
@@ -4865,6 +5025,7 @@ func (h *Harness) SetCompactionSettings(_ context.Context, settings CompactionSe
 	h.configurationMu.Lock()
 	h.compaction = settings
 	h.configurationMu.Unlock()
+	h.events.Emit(ctx, HarnessEvent{Type: string(EventConfigUpdate), Payload: map[string]JSONValue{"property": "compactionSettings"}})
 	return nil
 }
 func (h *Harness) GetSteeringMode(context.Context) (QueueMode, error) {
@@ -4872,7 +5033,7 @@ func (h *Harness) GetSteeringMode(context.Context) (QueueMode, error) {
 	defer h.configurationMu.RUnlock()
 	return h.steeringMode, nil
 }
-func (h *Harness) SetSteeringMode(_ context.Context, mode QueueMode) error {
+func (h *Harness) SetSteeringMode(ctx context.Context, mode QueueMode) error {
 	if err := h.lifecycle.Err(); err != nil {
 		return err
 	}
@@ -4882,6 +5043,7 @@ func (h *Harness) SetSteeringMode(_ context.Context, mode QueueMode) error {
 	h.configurationMu.Lock()
 	h.steeringMode = mode
 	h.configurationMu.Unlock()
+	h.events.Emit(ctx, HarnessEvent{Type: string(EventConfigUpdate), Payload: map[string]JSONValue{"property": "steeringMode"}})
 	return nil
 }
 func (h *Harness) GetFollowUpMode(context.Context) (QueueMode, error) {
@@ -4889,7 +5051,7 @@ func (h *Harness) GetFollowUpMode(context.Context) (QueueMode, error) {
 	defer h.configurationMu.RUnlock()
 	return h.followUpMode, nil
 }
-func (h *Harness) SetFollowUpMode(_ context.Context, mode QueueMode) error {
+func (h *Harness) SetFollowUpMode(ctx context.Context, mode QueueMode) error {
 	if err := h.lifecycle.Err(); err != nil {
 		return err
 	}
@@ -4899,6 +5061,7 @@ func (h *Harness) SetFollowUpMode(_ context.Context, mode QueueMode) error {
 	h.configurationMu.Lock()
 	h.followUpMode = mode
 	h.configurationMu.Unlock()
+	h.events.Emit(ctx, HarnessEvent{Type: string(EventConfigUpdate), Payload: map[string]JSONValue{"property": "followUpMode"}})
 	return nil
 }
 

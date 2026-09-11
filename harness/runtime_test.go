@@ -423,6 +423,33 @@ func TestHarnessRestoresAllPersistedLanes(t *testing.T) {
 	}
 }
 
+func TestHarnessSurfaceEmitsConfigurationAndFactEvents(t *testing.T) {
+	harness, _ := newRetryHarness(t, &retryModels{outcomes: []retryOutcome{{message: AgentMessage{Role: "assistant", Content: "answer", StopReason: StopReasonStop}}}}, RetryPolicy{})
+	var types []string
+	harness.Events().On("*", func(_ context.Context, event HarnessEvent) { types = append(types, event.Type) })
+	if err := harness.SetStreamOptions(context.Background(), AgentHarnessStreamOptions{TimeoutMs: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if err := harness.runtimeLane.SetThinkingLevel(context.Background(), ThinkingLow); err != nil {
+		t.Fatal(err)
+	}
+	if err := harness.Session().SetName(context.Background(), stringPointer("session")); err != nil {
+		t.Fatal(err)
+	}
+	if !containsEventType(types, string(EventConfigUpdate)) || !containsEventType(types, string(EventFactUpdate)) {
+		t.Fatalf("surface event types = %v", types)
+	}
+}
+
+func containsEventType(types []string, wanted string) bool {
+	for _, value := range types {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+
 func TestHarnessPreservesProviderErrorResponseAndUsage(t *testing.T) {
 	models := &retryModels{outcomes: []retryOutcome{{message: AgentMessage{Role: "assistant", Content: "quota exceeded", StopReason: StopReasonError, Usage: &Usage{Input: 4, Output: 1, Total: 5}}}}}
 	harness, session := newRetryHarness(t, models, RetryPolicy{})

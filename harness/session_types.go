@@ -86,6 +86,7 @@ type Session interface {
 	View(string) SessionTree
 	Commit(context.Context, Transaction) (CommitResult, error)
 	GetEntries(context.Context, []string) (map[string]Entry, error)
+	ScanUsage(context.Context, UsageScan) ([]UsageRow, error)
 	GetRegister(context.Context, RegisterNamespace, string) (*Register, error)
 	ListRegisters(context.Context, RegisterNamespace, string) ([]Register, error)
 	Close(context.Context) error

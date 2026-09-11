@@ -1028,6 +1028,7 @@ func cloneEvent(event HarnessEvent) HarnessEvent {
 type HookRunner struct {
 	mu       sync.RWMutex
 	handlers map[HookName][]hookRegistration
+	onError  func(HookInvocation, string, any)
 }
 
 type hookRegistration struct {
@@ -1077,7 +1078,19 @@ func (r *HookRunner) Run(ctx context.Context, invocation HookInvocation) (JSONVa
 	var aggregate JSONValue
 	for _, registration := range handlers {
 		invocation.Prior = aggregate
-		result, err := registration.handler(ctx, invocation)
+		var result JSONValue
+		var err error
+		var panicked any
+		func() {
+			defer func() { panicked = recover() }()
+			result, err = registration.handler(ctx, invocation)
+		}()
+		if panicked != nil {
+			if r.onError != nil {
+				r.onError(invocation, registration.id, panicked)
+			}
+			err = fmt.Errorf("hook handler %s panicked", registration.id)
+		}
 		if err != nil {
 			if invocation.Name == HookBeforeTool {
 				return map[string]JSONValue{"block": map[string]JSONValue{"reason": "hook failed", "handler": registration.id}}, nil
