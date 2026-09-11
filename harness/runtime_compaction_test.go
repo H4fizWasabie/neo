@@ -301,3 +301,82 @@ func TestHarnessSecondOverflowUsesBoundedFailure(t *testing.T) {
 		t.Fatalf("second overflow ledger = %+v", entries)
 	}
 }
+
+func newNavigationHarness(t *testing.T, models *retryModels) (*Harness, Session, string, string) {
+	t.Helper()
+	ctx := context.Background()
+	repo := NewMemorySessionRepo(SessionCodecOptions{})
+	session, err := repo.Create(ctx, SessionCreateOptions{ID: t.Name()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.View("main").AppendMessage(ctx, AgentMessage{Role: "user", Content: "root"}); err != nil {
+		t.Fatal(err)
+	}
+	target, err := session.View("main").AppendMessage(ctx, AgentMessage{Role: "assistant", Content: "target", StopReason: StopReasonStop})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := session.View("main").AppendMessage(ctx, AgentMessage{Role: "user", Content: "source"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness, suspended, err := NewHarness(ctx, AgentHarnessOptions{Session: session, Models: models, Model: models.model})
+	if err != nil || len(suspended) != 0 {
+		t.Fatalf("harness creation failed: %v %+v", err, suspended)
+	}
+	return harness, session, target, source
+}
+
+func TestHarnessNavigationMovesAndLabelsInOneResult(t *testing.T) {
+	harness, session, target, source := newNavigationHarness(t, &retryModels{model: Model{Provider: "provider", ModelID: "model"}})
+	result, err := harness.NavigateTree(context.Background(), &target, NavigateOptions{Label: "checkpoint"})
+	if err != nil || !result.OK || result.Value.Kind != "completed" || result.Value.OldLeafID == nil || *result.Value.OldLeafID != source || result.Value.NewLeafID == nil || *result.Value.NewLeafID != target {
+		t.Fatalf("navigation result = %v %+v", err, result)
+	}
+	leaf, err := session.View("main").GetLeafID(context.Background())
+	if err != nil || leaf == nil || *leaf != target {
+		t.Fatalf("navigation leaf = %v %v", err, leaf)
+	}
+	label, err := session.View("main").GetLabel(context.Background(), target)
+	if err != nil || label == nil || *label != "checkpoint" {
+		t.Fatalf("navigation label = %v %v", err, label)
+	}
+	last, err := harness.GetLastResult(context.Background())
+	if err != nil || last == nil || last.Kind != OperationNavigation || last.Outcome != "completed" {
+		t.Fatalf("navigation last result = %v %+v", err, last)
+	}
+}
+
+func TestHarnessSummarizedNavigationUsesHookAndPublishesBranchSummary(t *testing.T) {
+	models := &retryModels{model: Model{Provider: "provider", ModelID: "model"}}
+	harness, session, target, source := newNavigationHarness(t, models)
+	if _, err := harness.Hooks().On(HookBeforeNavigation, func(context.Context, HookInvocation) (JSONValue, error) {
+		return map[string]JSONValue{"summary": BranchSummaryResult{Summary: "branch summary", Usage: &Usage{Total: 3}}}, nil
+	}, "summary"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := harness.NavigateTree(context.Background(), &target, NavigateOptions{Summarize: true})
+	if err != nil || !result.OK || result.Value.Kind != "completed" || result.Value.SummaryEntry == nil {
+		t.Fatalf("summarized navigation result = %v %+v", err, result)
+	}
+	if models.Calls() != 0 || result.Value.SummaryEntry.Summary != "branch summary" || result.Value.SummaryEntry.ParentID == nil || *result.Value.SummaryEntry.ParentID != target || result.Value.SummaryEntry.FromID != source {
+		t.Fatalf("summarized navigation = calls %d %+v", models.Calls(), result.Value.SummaryEntry)
+	}
+	leaf, err := session.View("main").GetLeafID(context.Background())
+	if err != nil || leaf == nil || *leaf != result.Value.SummaryEntry.ID {
+		t.Fatalf("summarized navigation leaf = %v %v", err, leaf)
+	}
+}
+
+func TestHarnessSummarizedNavigationGeneratesSummary(t *testing.T) {
+	models := &retryModels{
+		model:    Model{Provider: "provider", ModelID: "model"},
+		outcomes: []retryOutcome{{message: AgentMessage{Role: "assistant", Content: "generated", StopReason: StopReasonStop}}},
+	}
+	harness, _, target, _ := newNavigationHarness(t, models)
+	result, err := harness.NavigateTree(context.Background(), &target, NavigateOptions{Summarize: true, CustomInstructions: "keep decisions"})
+	if err != nil || !result.OK || result.Value.Kind != "completed" || result.Value.SummaryEntry == nil || result.Value.SummaryEntry.Summary != "generated" || models.Calls() != 1 {
+		t.Fatalf("generated navigation = %v %+v calls=%d", err, result, models.Calls())
+	}
+}

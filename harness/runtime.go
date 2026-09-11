@@ -1362,6 +1362,9 @@ func (h *Harness) runSummaryAttempt(ctx context.Context, lane *runtimeLane, oper
 		return AgentMessage{}, err
 	}
 	messages := append([]Message(nil), preparation.MessagesToSummarize...)
+	if preparation.Kind == EntryBranchSummary {
+		messages = append([]Message(nil), preparation.Messages...)
+	}
 	var output EffectOutput
 	err := h.effect(ctx, ActionInfo{Kind: "provider", Description: "compaction summary"}, func(ctx context.Context) error {
 		var err error
@@ -3226,9 +3229,379 @@ func (l *runtimeLane) Compact(ctx context.Context, customInstructions string) (R
 	}
 	return Ok[CompactionOutcome, error](outcome), nil
 }
-func (l *runtimeLane) NavigateTree(context.Context, *string, NavigateOptions) (Result[NavigationOutcome, error], error) {
-	return Err[NavigationOutcome](fmt.Errorf("navigation is not implemented")), nil
+func (l *runtimeLane) NavigateTree(ctx context.Context, targetID *string, options NavigateOptions) (Result[NavigationOutcome, error], error) {
+	if err := l.harness.lifecycle.Err(); err != nil {
+		return Result[NavigationOutcome, error]{Err: err}, nil
+	}
+	var operation Operation
+	var state OperationState
+	var accepted bool
+	err := l.harness.line(l.name).Do(ctx, func() error {
+		laneRegister, err := l.harness.session.GetRegister(ctx, RegisterLaneState, l.name)
+		if err != nil || laneRegister == nil {
+			return err
+		}
+		laneState, ok := laneRegister.Value.(LaneState)
+		if !ok {
+			return fmt.Errorf("lane state has invalid type")
+		}
+		if laneState.CurrentOperationID != nil {
+			kind := OperationRun
+			if meta, metaErr := l.harness.session.GetRegister(ctx, RegisterOpMeta, *laneState.CurrentOperationID); metaErr == nil && meta != nil {
+				if operation, metaOK := meta.Value.(Operation); metaOK {
+					kind = operation.Intent.Kind
+				}
+			}
+			return &LaneBusy{TaggedError: TaggedError{Message: "lane is busy"}, Lane: l.name, OperationID: *laneState.CurrentOperationID, OperationKind: kind}
+		}
+		leafRegister, err := l.harness.session.GetRegister(ctx, RegisterLaneLeaf, l.name)
+		if err != nil {
+			return err
+		}
+		var source *string
+		if leafRegister != nil {
+			source, ok = leafRegister.Value.(*string)
+			if !ok {
+				return fmt.Errorf("lane leaf has invalid type")
+			}
+		}
+		if targetID != nil && source != nil && *targetID == *source {
+			return &InvalidNavigation{TaggedError: TaggedError{Message: "target is current leaf"}, Lane: l.name, Reason: "target is current leaf"}
+		}
+		var target *Entry
+		if targetID != nil {
+			target, err = l.view.GetEntry(ctx, *targetID)
+			if err != nil {
+				return err
+			}
+			if target == nil {
+				return &UnknownTarget{TaggedError: TaggedError{Message: "unknown navigation target"}, TargetID: *targetID}
+			}
+			if target.ParentID == nil {
+				return &InvalidNavigation{TaggedError: TaggedError{Message: "cannot navigate to root entry"}, Lane: l.name, Reason: "target is root"}
+			}
+		} else if options.Summarize {
+			return &InvalidNavigation{TaggedError: TaggedError{Message: "summarized navigation requires a target"}, Lane: l.name, Reason: "null target cannot be summarized"}
+		}
+		if options.Label != "" && (targetID == nil || target.ParentID == nil) {
+			return &InvalidNavigation{TaggedError: TaggedError{Message: "cannot label root"}, Lane: l.name, Reason: "label on root target"}
+		}
+		if options.Summarize && source == nil {
+			return &InvalidNavigation{TaggedError: TaggedError{Message: "cannot summarize from root"}, Lane: l.name, Reason: "summarize from root"}
+		}
+		configRegister, err := l.harness.session.GetRegister(ctx, RegisterLaneConfig, l.name)
+		if err != nil || configRegister == nil {
+			return err
+		}
+		config, ok := configRegister.Value.(LaneConfiguration)
+		if !ok {
+			return fmt.Errorf("lane configuration has invalid type")
+		}
+		if options.Summarize {
+			if missing := l.missingIdentities(ctx, config); missing != nil {
+				return missing
+			}
+		}
+		operationID := l.harness.session.IDGenerator().Next()
+		taskID := "task:1"
+		operation = Operation{OperationID: operationID, Lane: l.name, SourceLeafID: cloneStringPointer(source), StartedAt: time.Now().UnixMilli(), Intent: OperationIntent{Kind: OperationNavigation, TargetID: cloneStringPointer(targetID), Summarize: options.Summarize, Label: options.Label, CustomInstructions: options.CustomInstructions}}
+		state = OperationState{Kind: OperationNavigation, Navigation: &NavigationState{Kind: OperationNavigation, Control: Control{Status: ControlRunning}, TargetID: cloneStringPointer(targetID), Label: options.Label, CustomInstructions: options.CustomInstructions, Summarize: options.Summarize, Phase: NavigationPhase{Kind: "ready_to_commit"}}}
+		writes := []Write{}
+		if options.Summarize {
+			entries, err := l.view.FindEntriesOnBranch(ctx, BranchScan{Start: *source, Order: NewestFirst})
+			if err != nil {
+				return err
+			}
+			messages, err := ProjectContext(ctx, entries, l.harness.entryProjectors)
+			if err != nil {
+				return err
+			}
+			if len(messages) == 0 {
+				return &InvalidNavigation{TaggedError: TaggedError{Message: "nothing to summarize"}, Lane: l.name, Reason: "empty source branch"}
+			}
+			prep := DurableStructuralPreparation{Kind: EntryBranchSummary, Messages: messages, TotalTokens: int64(len(messages))}
+			state.Navigation.Phase = NavigationPhase{Kind: "summary", Structural: &StructuralDecision{TaskID: taskID, Status: "deciding"}}
+			writes = append(writes, registerSet(RegisterOpPreparation, operationID+":"+taskID, prep))
+		}
+		laneState.CurrentOperationID = &operationID
+		writes = append(writes, registerSet(RegisterOpMeta, operationID, operation), registerSet(RegisterOpState, operationID, state), registerSet(RegisterLaneState, l.name, laneState))
+		_, err = l.harness.session.Commit(ctx, Transaction{Writes: writes})
+		accepted = err == nil
+		return err
+	})
+	if err != nil {
+		return Result[NavigationOutcome, error]{Err: err}, nil
+	}
+	if !accepted {
+		return Result[NavigationOutcome, error]{Err: fmt.Errorf("navigation was not accepted")}, nil
+	}
+	l.begin()
+	l.harness.events.Emit(ctx, HarnessEvent{Type: string(EventNavigationStart), Lane: l.name, Payload: map[string]JSONValue{"runId": operation.OperationID}})
+	outcome, err := l.harness.driveNavigation(ctx, l, operation, state)
+	if err != nil {
+		return Result[NavigationOutcome, error]{Err: err}, nil
+	}
+	return Ok[NavigationOutcome, error](outcome), nil
 }
+
+func (h *Harness) driveNavigation(ctx context.Context, lane *runtimeLane, operation Operation, state OperationState) (NavigationOutcome, error) {
+	current, err := h.currentOperation(ctx, lane)
+	if err != nil {
+		return NavigationOutcome{}, err
+	}
+	for {
+		navigation := current.State.Navigation
+		if navigation == nil {
+			return NavigationOutcome{}, fmt.Errorf("navigation state is missing")
+		}
+		if navigation.Control.Status == ControlCancelRequested {
+			return h.finishNavigation(ctx, lane, operation, current, nil, "aborted", nil)
+		}
+		if navigation.Phase.Kind == "ready_to_commit" {
+			return h.finishNavigation(ctx, lane, operation, current, nil, "completed", nil)
+		}
+		if navigation.Phase.Structural == nil || navigation.Phase.Kind != "summary" {
+			return NavigationOutcome{}, fmt.Errorf("unsupported navigation phase %q", navigation.Phase.Kind)
+		}
+		register, err := h.session.GetRegister(ctx, RegisterOpPreparation, operation.OperationID+":"+navigation.Phase.Structural.TaskID)
+		if err != nil || register == nil {
+			if err == nil {
+				err = fmt.Errorf("navigation preparation is missing")
+			}
+			return NavigationOutcome{}, err
+		}
+		prep, ok := register.Value.(DurableStructuralPreparation)
+		if !ok || prep.Kind != EntryBranchSummary {
+			return NavigationOutcome{}, fmt.Errorf("navigation preparation has invalid type")
+		}
+		structural := navigation.Phase.Structural
+		if structural.Status == "deciding" {
+			decision, err := h.runNavigationHook(ctx, lane, operation, prep)
+			if err != nil {
+				return h.finishNavigation(ctx, lane, operation, current, nil, "failed", &OperationError{Code: "navigation", Message: err.Error()})
+			}
+			if decision.decline {
+				return h.finishNavigation(ctx, lane, operation, current, nil, "declined", nil)
+			}
+			if decision.result != nil {
+				return h.finishNavigation(ctx, lane, operation, current, decision.result, "completed", nil)
+			}
+			settings := h.settings.Snapshot()
+			resultID := h.session.IDGenerator().Next()
+			next := current.State
+			next.Navigation.Phase.Structural.Status = "generating"
+			next.Navigation.Phase.Structural.Generation = &SummaryGeneration{Status: GenerationReady, NextAttempt: 1, Context: SummaryContext{TaskID: structural.TaskID, ResultEntryID: resultID, Kind: EntryBranchSummary, Configuration: current.Configuration, StreamOptions: settings.StreamOptions, RetryPolicy: settings.RetryPolicy, Reason: "navigation"}, UsageIDs: []string{}}
+			var transition *CurrentOperation
+			fx := &runtimeEffects{harness: h, lane: lane}
+			if err := h.effect(ctx, ActionInfo{Kind: "transition", Description: "navigation summary generating"}, func(ctx context.Context) error {
+				var err error
+				transition, err = fx.CommitTransition(ctx, current, next, h.telemetry, &current.ConfigurationSeq, nil)
+				return err
+			}); err != nil {
+				return NavigationOutcome{}, err
+			}
+			if transition == nil {
+				return NavigationOutcome{}, fmt.Errorf("navigation decision lost its compare-and-swap")
+			}
+			current = *transition
+			continue
+		}
+		if structural.Status != "generating" || structural.Generation == nil {
+			return NavigationOutcome{}, fmt.Errorf("unsupported navigation structural status %q", structural.Status)
+		}
+		generation := *structural.Generation
+		if generation.Status == GenerationRetryWait {
+			if delay := generation.NotBefore - time.Now().UnixMilli(); delay > 0 {
+				if err := h.effect(ctx, ActionInfo{Kind: "wait", Description: "navigation summary retry wait"}, func(ctx context.Context) error {
+					return (&runtimeEffects{harness: h, lane: lane}).Sleep(ctx, delay, h.telemetry)
+				}); err != nil {
+					return NavigationOutcome{}, err
+				}
+			}
+			next := current.State
+			next.Navigation.Phase.Structural.Generation.Status = GenerationReady
+			if err := h.commitState(ctx, lane, operation.OperationID, next); err != nil {
+				return NavigationOutcome{}, err
+			}
+			current, err = h.currentOperation(ctx, lane)
+			if err != nil {
+				return NavigationOutcome{}, err
+			}
+			continue
+		}
+		if generation.Status == GenerationEffectPending {
+			next := current.State
+			next.Navigation.Phase.Structural.Generation.Status = GenerationReady
+			next.Navigation.Phase.Structural.Generation.NextAttempt = generation.Attempt + 1
+			next.Navigation.Phase.Structural.Generation.Attempt = 0
+			next.Navigation.Phase.Structural.Generation.Request = nil
+			if err := h.commitState(ctx, lane, operation.OperationID, next); err != nil {
+				return NavigationOutcome{}, err
+			}
+			current, err = h.currentOperation(ctx, lane)
+			if err != nil {
+				return NavigationOutcome{}, err
+			}
+			continue
+		}
+		if generation.Status != GenerationReady {
+			return NavigationOutcome{}, fmt.Errorf("unsupported navigation generation status %q", generation.Status)
+		}
+		attempt := generation.NextAttempt
+		if attempt == 0 {
+			attempt = generation.Attempt + 1
+		}
+		options := generation.Context.StreamOptions
+		options.Deferred = false
+		fx := &runtimeEffects{harness: h, lane: lane}
+		if err := h.runBeforeRequestStep(ctx, fx, operation, attempt, "navigation", fmt.Sprintf("%s:attempt:%d", generation.Context.TaskID, attempt), &options); err != nil {
+			return h.finishNavigation(ctx, lane, operation, current, nil, "failed", &OperationError{Code: "navigation", Message: err.Error()})
+		}
+		usageID := h.session.IDGenerator().Next()
+		next := current.State
+		next.Navigation.Phase.Structural.Generation.Status = GenerationEffectPending
+		next.Navigation.Phase.Structural.Generation.Attempt = attempt
+		next.Navigation.Phase.Structural.Generation.NextAttempt = attempt
+		next.Navigation.Phase.Structural.Generation.Request = &SummaryRequest{Index: len(generation.UsageIDs), UsageID: usageID}
+		var transition *CurrentOperation
+		if err := h.effect(ctx, ActionInfo{Kind: "transition", Description: "navigation summary request pending"}, func(ctx context.Context) error {
+			var err error
+			transition, err = fx.CommitTransition(ctx, current, next, h.telemetry, nil, nil)
+			return err
+		}); err != nil {
+			return NavigationOutcome{}, err
+		}
+		if transition == nil {
+			return NavigationOutcome{}, fmt.Errorf("navigation summary request lost its compare-and-swap")
+		}
+		current = *transition
+		generation = *current.State.Navigation.Phase.Structural.Generation
+		message, err := h.runSummaryAttempt(ctx, lane, operation, prep, generation, options, fx)
+		if err != nil {
+			if generation.Attempt < generation.Context.RetryPolicy.MaxAttempts {
+				next := current.State
+				next.Navigation.Phase.Structural.Generation.Status = GenerationRetryWait
+				next.Navigation.Phase.Structural.Generation.NextAttempt = generation.Attempt + 1
+				next.Navigation.Phase.Structural.Generation.NotBefore = retryNotBefore(time.Now().UnixMilli(), retryDelay(generation.Context.RetryPolicy, generation.Context.StreamOptions, generation.Attempt))
+				next.Navigation.Phase.Structural.Generation.Request = nil
+				next.Navigation.Phase.Structural.Generation.UsageIDs = append(append([]string(nil), generation.UsageIDs...), generation.Request.UsageID)
+				if err := h.line(lane.name).Do(ctx, func() error {
+					_, err := h.session.Commit(ctx, Transaction{Writes: []Write{{Kind: WriteUsage, Usage: &UsageWrite{Row: UsageRow{ID: generation.Request.UsageID, Usage: Usage{}}}}, registerSet(RegisterOpState, operation.OperationID, next)}})
+					return err
+				}); err != nil {
+					return NavigationOutcome{}, err
+				}
+				current, err = h.currentOperation(ctx, lane)
+				if err != nil {
+					return NavigationOutcome{}, err
+				}
+				continue
+			}
+			return h.finishNavigation(ctx, lane, operation, current, nil, "failed", &OperationError{Code: "navigation", Message: err.Error()})
+		}
+		return h.finishNavigation(ctx, lane, operation, current, &BranchSummaryResult{Summary: summaryText(message), Usage: message.Usage}, "completed", nil)
+	}
+}
+
+type navigationDecision struct {
+	decline bool
+	result  *BranchSummaryResult
+}
+
+func (h *Harness) runNavigationHook(ctx context.Context, lane *runtimeLane, operation Operation, preparation DurableStructuralPreparation) (navigationDecision, error) {
+	var result JSONValue
+	if err := h.effect(ctx, ActionInfo{Kind: "hook", Description: "before_navigation"}, func(ctx context.Context) error {
+		var err error
+		result, err = h.hooks.Run(ctx, HookInvocation{Name: HookBeforeNavigation, Lane: lane.name, RunID: operation.OperationID, Event: map[string]JSONValue{"targetId": stringValue(operation.Intent.TargetID), "preparation": BranchPreparation{Messages: cloneValue(preparation.Messages).([]AgentMessage), TotalTokens: preparation.TotalTokens}, "customInstructions": operation.Intent.CustomInstructions}})
+		return err
+	}); err != nil {
+		return navigationDecision{}, err
+	}
+	values, _ := result.(map[string]JSONValue)
+	if values == nil {
+		return navigationDecision{}, nil
+	}
+	decision := navigationDecision{}
+	decision.decline, _ = values["decline"].(bool)
+	if summary, ok := values["summary"].(BranchSummaryResult); ok {
+		decision.result = &summary
+	}
+	if decision.decline && decision.result != nil {
+		return navigationDecision{}, nil
+	}
+	return decision, nil
+}
+
+func (h *Harness) finishNavigation(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation, result *BranchSummaryResult, kind string, errorValue *OperationError) (NavigationOutcome, error) {
+	if current.State.Navigation == nil {
+		return NavigationOutcome{}, fmt.Errorf("navigation state is missing")
+	}
+	leaf := cloneStringPointer(current.State.Navigation.TargetID)
+	var summaryEntry *Entry
+	writes := make([]Write, 0, 12)
+	if result != nil {
+		if result.Summary == "" {
+			return NavigationOutcome{}, fmt.Errorf("navigation summary has no text")
+		}
+		generation := current.State.Navigation.Phase.Structural.Generation
+		id := h.session.IDGenerator().Next()
+		if generation != nil && generation.Context.ResultEntryID != "" {
+			id = generation.Context.ResultEntryID
+		}
+		entry := Entry{EntryBase: EntryBase{ID: id, ParentID: cloneStringPointer(current.State.Navigation.TargetID), Type: EntryBranchSummary}, Summary: result.Summary, Usage: result.Usage, FromHook: current.State.Navigation.Phase.Structural.Generation == nil, FromID: stringValue(operation.SourceLeafID)}
+		summaryEntry = &entry
+		writes = append(writes, registerSet(RegisterLaneLeaf, lane.name, cloneStringPointer(current.State.Navigation.TargetID)), Write{Kind: WriteEntry, Entry: &EntryWrite{Entry: entry}}, registerSet(RegisterLaneLeaf, lane.name, stringPointer(id)))
+		leaf = stringPointer(id)
+		if generation != nil && generation.Request != nil {
+			writes = append(writes, Write{Kind: WriteUsage, Usage: &UsageWrite{Row: UsageRow{ID: generation.Request.UsageID, Usage: usageValue(result.Usage), EntryID: stringPointer(id)}}})
+		} else if result.Usage != nil {
+			writes = append(writes, Write{Kind: WriteUsage, Usage: &UsageWrite{Row: UsageRow{ID: h.session.IDGenerator().Next(), Usage: *result.Usage, EntryID: stringPointer(id)}}})
+		}
+	} else {
+		writes = append(writes, registerSet(RegisterLaneLeaf, lane.name, cloneStringPointer(leaf)))
+	}
+	if current.State.Navigation.Label != "" && current.State.Navigation.TargetID != nil {
+		writes = append(writes, registerSet(RegisterFactLabel, *current.State.Navigation.TargetID, current.State.Navigation.Label))
+	}
+	cleanup, err := h.operationCleanupWrites(ctx, operation.OperationID, current.State)
+	if err != nil {
+		return NavigationOutcome{}, err
+	}
+	writes = append(writes, cleanup...)
+	writes = append(writes, registerSet(RegisterLaneLastResult, lane.name, LaneLastResult{OperationID: operation.OperationID, Kind: OperationNavigation, Outcome: kind, LeafID: leaf, Error: errorValue}))
+	laneStateIndex := len(writes)
+	writes = append(writes, registerSet(RegisterLaneState, lane.name, LaneState{}))
+	if err := h.effect(ctx, ActionInfo{Kind: "terminal", Description: "navigation terminal"}, func(ctx context.Context) error {
+		return h.line(lane.name).Do(ctx, func() error {
+			latest, err := h.session.GetRegister(ctx, RegisterLaneState, lane.name)
+			if err != nil || latest == nil {
+				return err
+			}
+			value, ok := latest.Value.(LaneState)
+			if !ok {
+				return fmt.Errorf("lane state has invalid type")
+			}
+			value.CurrentOperationID = nil
+			writes[laneStateIndex] = registerSet(RegisterLaneState, lane.name, value)
+			valid, err := (&runtimeEffects{harness: h, lane: lane}).current(ctx, current)
+			if err != nil || !valid {
+				if err == nil {
+					err = errOperationMissing
+				}
+				return err
+			}
+			_, err = h.session.Commit(ctx, Transaction{Writes: writes})
+			return err
+		})
+	}); err != nil {
+		return NavigationOutcome{}, err
+	}
+	lane.finish()
+	outcome := NavigationOutcome{Kind: kind, OldLeafID: cloneStringPointer(operation.SourceLeafID), NewLeafID: leaf, LeafID: leaf, SummaryEntry: summaryEntry, Error: errorValue}
+	h.events.Emit(ctx, HarnessEvent{Type: string(EventNavigationEnd), Lane: lane.name, Payload: cloneValue(outcome)})
+	return outcome, nil
+}
+
 func (l *runtimeLane) Resume(ctx context.Context) (Result[ResumeOutcome, error], error) {
 	if err := l.harness.lifecycle.Err(); err != nil {
 		return Result[ResumeOutcome, error]{Err: err}, nil
@@ -3256,6 +3629,21 @@ func (l *runtimeLane) Resume(ctx context.Context) (Result[ResumeOutcome, error],
 			return Result[ResumeOutcome, error]{Err: err}, nil
 		}
 		return Ok[ResumeOutcome, error](ResumeOutcome{Operation: OperationCompaction, RunID: current.Operation.OperationID, Compaction: &outcome}), nil
+	}
+	if current.Operation.Intent.Kind == OperationNavigation && current.State.Navigation != nil {
+		if current.State.Navigation.Summarize {
+			if missing := l.missingIdentities(ctx, current.Configuration); missing != nil {
+				return Result[ResumeOutcome, error]{Err: missing}, nil
+			}
+		}
+		if err := l.harness.line(l.name).Do(ctx, func() error { l.begin(); return nil }); err != nil {
+			return Result[ResumeOutcome, error]{Err: err}, nil
+		}
+		outcome, err := l.harness.driveNavigation(ctx, l, current.Operation, current.State)
+		if err != nil {
+			return Result[ResumeOutcome, error]{Err: err}, nil
+		}
+		return Ok[ResumeOutcome, error](ResumeOutcome{Operation: OperationNavigation, RunID: current.Operation.OperationID, Navigation: &outcome}), nil
 	}
 	if current.Operation.Intent.Kind != OperationRun || current.State.Run == nil {
 		return Result[ResumeOutcome, error]{Err: fmt.Errorf("resume for %s is not implemented", current.Operation.Intent.Kind)}, nil
@@ -3314,20 +3702,33 @@ func (l *runtimeLane) Abort(ctx context.Context) (Result[AbortOutcome, error], e
 			return err
 		}
 		if current.State.Run == nil {
-			if current.State.Compaction == nil {
-				return &NoActiveOperation{TaggedError: TaggedError{Message: "operation is not a run"}, Lane: l.name}
-			}
-			compaction := current.State.Compaction
-			if compaction.Control.Status == ControlRunning {
-				compaction.Control.Status = ControlCancelRequested
-				compaction.Control.RequestedAt = time.Now().UnixMilli()
-				if _, err := l.harness.session.Commit(ctx, Transaction{Writes: []Write{registerSet(RegisterOpState, current.Operation.OperationID, current.State)}}); err != nil {
-					return err
+			if current.State.Compaction != nil {
+				compaction := current.State.Compaction
+				if compaction.Control.Status == ControlRunning {
+					compaction.Control.Status = ControlCancelRequested
+					compaction.Control.RequestedAt = time.Now().UnixMilli()
+					if _, err := l.harness.session.Commit(ctx, Transaction{Writes: []Write{registerSet(RegisterOpState, current.Operation.OperationID, current.State)}}); err != nil {
+						return err
+					}
+					shouldSignal = true
 				}
-				shouldSignal = true
+				outcome.RunID = current.Operation.OperationID
+				return nil
 			}
-			outcome.RunID = current.Operation.OperationID
-			return nil
+			if current.State.Navigation != nil {
+				navigation := current.State.Navigation
+				if navigation.Control.Status == ControlRunning {
+					navigation.Control.Status = ControlCancelRequested
+					navigation.Control.RequestedAt = time.Now().UnixMilli()
+					if _, err := l.harness.session.Commit(ctx, Transaction{Writes: []Write{registerSet(RegisterOpState, current.Operation.OperationID, current.State)}}); err != nil {
+						return err
+					}
+					shouldSignal = true
+				}
+				outcome.RunID = current.Operation.OperationID
+				return nil
+			}
+			return &NoActiveOperation{TaggedError: TaggedError{Message: "operation is not a run"}, Lane: l.name}
 		}
 		if current.State.Run == nil {
 			return &NoActiveOperation{TaggedError: TaggedError{Message: "operation is not a run"}, Lane: l.name}
