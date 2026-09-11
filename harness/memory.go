@@ -79,10 +79,19 @@ func (s *MemoryStorage) Commit(ctx context.Context, tx Transaction) (CommitResul
 	}
 	s.data.mu.Lock()
 	defer s.data.mu.Unlock()
-	return s.commitLocked(tx)
+	return s.commitLocked(tx, nil)
 }
 
-func (s *MemoryStorage) commitLocked(tx Transaction) (CommitResult, error) {
+func (s *MemoryStorage) commitWithPublish(ctx context.Context, tx Transaction, publish func(CommitResult) error) (CommitResult, error) {
+	if err := s.admitted(ctx); err != nil {
+		return CommitResult{}, err
+	}
+	s.data.mu.Lock()
+	defer s.data.mu.Unlock()
+	return s.commitLocked(tx, publish)
+}
+
+func (s *MemoryStorage) commitLocked(tx Transaction, publish func(CommitResult) error) (CommitResult, error) {
 	entries := cloneEntries(s.data.entries)
 	registers := cloneRegisters(s.data.registers)
 	usage := cloneUsage(s.data.usage)
@@ -135,6 +144,11 @@ func (s *MemoryStorage) commitLocked(tx Transaction) (CommitResult, error) {
 		seq++
 	}
 
+	if publish != nil {
+		if err := publish(result); err != nil {
+			return CommitResult{}, err
+		}
+	}
 	s.data.entries = entries
 	s.data.registers = registers
 	s.data.usage = usage

@@ -35,9 +35,6 @@ func (r *MemorySessionRepo) Create(ctx context.Context, options SessionCreateOpt
 	if id == "" {
 		id = NewUUIDv7Generator().Next()
 	}
-	if !isUUIDv7(id) {
-		return nil, sessionError(SessionInvalidPayload, fmt.Errorf("invalid session id %q", id))
-	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, exists := r.sessions[id]; exists {
@@ -117,9 +114,6 @@ func (r *MemorySessionRepo) Fork(ctx context.Context, source SessionMetadata, op
 	if id == "" {
 		id = NewUUIDv7Generator().Next()
 	}
-	if !isUUIDv7(id) {
-		return nil, sessionError(SessionInvalidPayload, fmt.Errorf("invalid session id %q", id))
-	}
 	if _, exists := r.sessions[id]; exists {
 		return nil, sessionError(SessionAlreadyExists, fmt.Errorf("session already exists: %s", id))
 	}
@@ -139,12 +133,16 @@ func newMemoryData() *memoryData {
 
 type MemorySession struct {
 	metadata SessionMetadata
-	storage  *MemoryStorage
+	storage  Storage
 	idgen    *UUIDv7Generator
 	main     *memoryTree
 }
 
 func newMemorySession(metadata SessionMetadata, storage *MemoryStorage) *MemorySession {
+	return newSession(metadata, storage)
+}
+
+func newSession(metadata SessionMetadata, storage Storage) *MemorySession {
 	idgen := NewUUIDv7Generator()
 	return &MemorySession{metadata: metadata, storage: storage, idgen: idgen, main: &memoryTree{session: nil, storage: storage, lane: "main", idgen: idgen}}
 }
@@ -266,7 +264,7 @@ func (s *MemorySession) AppendCustomEntry(ctx context.Context, customType string
 
 type memoryTree struct {
 	session *MemorySession
-	storage *MemoryStorage
+	storage Storage
 	lane    string
 	idgen   IDGenerator
 }
