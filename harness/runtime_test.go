@@ -19,7 +19,29 @@ type retryModels struct {
 	outcomes   []retryOutcome
 	resolveErr error
 	calls      int
+	cancelled  int
 }
+
+type blockingModels struct {
+	started chan struct{}
+	once    sync.Once
+}
+
+func (*blockingModels) Resolve(context.Context, string, string) (Model, error) {
+	return Model{Provider: "provider", ModelID: "model"}, nil
+}
+
+func (m *blockingModels) Stream(ctx context.Context, _ Model, _ []Message, _ AgentHarnessStreamOptions) (<-chan AgentEvent, error) {
+	m.once.Do(func() { close(m.started) })
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (*blockingModels) FetchDeferred(context.Context, Model, DeferredHandle, AgentHarnessStreamOptions) (DeferredResponse, error) {
+	return DeferredResponse{}, nil
+}
+
+func (*blockingModels) CancelDeferred(context.Context, Model, DeferredHandle) error { return nil }
 
 type retryOutcome struct {
 	err     error
@@ -97,12 +119,23 @@ func (*retryModels) FetchDeferred(context.Context, Model, DeferredHandle, AgentH
 	return DeferredResponse{}, nil
 }
 
-func (*retryModels) CancelDeferred(context.Context, Model, DeferredHandle) error { return nil }
+func (m *retryModels) CancelDeferred(context.Context, Model, DeferredHandle) error {
+	m.mu.Lock()
+	m.cancelled++
+	m.mu.Unlock()
+	return nil
+}
 
 func (m *retryModels) Calls() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.calls
+}
+
+func (m *retryModels) Cancelled() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cancelled
 }
 
 func (m *scriptedModels) Resolve(context.Context, string, string) (Model, error) {
@@ -745,5 +778,327 @@ func TestHarnessOneAtATimeSteerSurvivesReopen(t *testing.T) {
 	entries, err := reopened.FindEntries(ctx, EntryQuery{Order: OldestFirst})
 	if err != nil || len(entries) != 5 || entries[1].ID != ids[0] || entries[3].ID != ids[1] {
 		t.Fatalf("reopened one-at-a-time entries = %v %+v", err, entries)
+	}
+}
+
+func TestHarnessAbortDrainsQueuesAndCleansThemOnResume(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemorySessionRepo(SessionCodecOptions{})
+	session, err := repo.Create(ctx, SessionCreateOptions{ID: t.Name()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness, _, err := NewHarness(ctx, AgentHarnessOptions{Session: session, Models: &scriptedModels{}, Model: Model{Provider: "provider", ModelID: "model"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedRunOperation(t, session, RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationNeedAssistant}}}, nil)
+	steer, err := harness.runtimeLane.Steer(ctx, PromptInput{Text: "steer"})
+	if err != nil || !steer.OK {
+		t.Fatalf("steer = %v %+v", err, steer)
+	}
+	followUp, err := harness.runtimeLane.FollowUp(ctx, PromptInput{Text: "follow-up"})
+	if err != nil || !followUp.OK {
+		t.Fatalf("follow-up = %v %+v", err, followUp)
+	}
+	aborted, err := harness.runtimeLane.Abort(ctx)
+	if err != nil || !aborted.OK || aborted.Value.RunID == "" || len(aborted.Value.Steer) != 1 || len(aborted.Value.FollowUp) != 1 {
+		t.Fatalf("abort = %v %+v", err, aborted)
+	}
+	repeated, err := harness.runtimeLane.Abort(ctx)
+	if err != nil || !repeated.OK || len(repeated.Value.Steer) != 1 || len(repeated.Value.FollowUp) != 1 {
+		t.Fatalf("repeated abort = %v %+v", err, repeated)
+	}
+	for _, id := range []string{steer.Value.EntryID, followUp.Value.EntryID} {
+		register, err := session.GetRegister(ctx, RegisterPendingEntry, id)
+		if err != nil || register == nil {
+			t.Fatalf("drained register %s = %v %+v", id, err, register)
+		}
+	}
+	result, err := harness.runtimeLane.Resume(ctx)
+	if err != nil || !result.OK || result.Value.Run == nil || result.Value.Run.Kind != "aborted" {
+		t.Fatalf("aborted resume = %v %+v", err, result)
+	}
+	for _, id := range []string{steer.Value.EntryID, followUp.Value.EntryID} {
+		register, err := session.GetRegister(ctx, RegisterPendingEntry, id)
+		if err != nil || register != nil {
+			t.Fatalf("drained register survived terminal cleanup %s = %v %+v", id, err, register)
+		}
+	}
+	last, err := harness.GetLastResult(ctx)
+	if err != nil || last == nil || last.Outcome != "aborted" {
+		t.Fatalf("aborted last result = %v %+v", err, last)
+	}
+}
+
+func TestHarnessAbortSignalsLiveProvider(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemorySessionRepo(SessionCodecOptions{})
+	session, err := repo.Create(ctx, SessionCreateOptions{ID: t.Name()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	models := &blockingModels{started: make(chan struct{})}
+	harness, _, err := NewHarness(ctx, AgentHarnessOptions{Session: session, Models: models, Model: Model{Provider: "provider", ModelID: "model"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan Result[RunOutcome, error], 1)
+	go func() {
+		result, _ := harness.Prompt(ctx, PromptInput{Text: "interrupt"})
+		done <- result
+	}()
+	select {
+	case <-models.started:
+	case <-time.After(time.Second):
+		t.Fatal("provider did not start")
+	}
+	aborted, err := harness.Abort(ctx)
+	if err != nil || !aborted.OK {
+		t.Fatalf("live abort = %v %+v", err, aborted)
+	}
+	select {
+	case result := <-done:
+		if !result.OK || result.Value.Kind != "aborted" {
+			t.Fatalf("live abort result = %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("live provider did not reconcile after abort")
+	}
+}
+
+func TestHarnessAbortBestEffortCancelsDeferredSource(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemorySessionRepo(SessionCodecOptions{})
+	session, err := repo.Create(ctx, SessionCreateOptions{ID: t.Name()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle := DeferredHandle{Provider: "provider", ModelID: "model", ID: "deferred"}
+	source, err := session.View("main").AppendMessage(ctx, AgentMessage{Role: "assistant", Content: handle, StopReason: StopReasonDeferred})
+	if err != nil {
+		t.Fatal(err)
+	}
+	models := &retryModels{}
+	harness, _, err := NewHarness(ctx, AgentHarnessOptions{Session: session, Models: models, Model: Model{Provider: "provider", ModelID: "model"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedRunOperation(t, session, RunPhase{Kind: PhaseDeferred, Deferred: &Deferred{Status: DeferredSuspended, SourceEntryID: source, Configuration: LaneConfiguration{Model: Model{Provider: "provider", ModelID: "model"}}}}, &source)
+	if _, err := harness.runtimeLane.Abort(ctx); err != nil {
+		t.Fatal(err)
+	}
+	result, err := harness.runtimeLane.Resume(ctx)
+	if err != nil || !result.OK || result.Value.Run == nil || result.Value.Run.Kind != "aborted" {
+		t.Fatalf("deferred abort resume = %v %+v", err, result)
+	}
+	if models.Cancelled() != 1 {
+		t.Fatalf("deferred cancellations = %d, want 1", models.Cancelled())
+	}
+}
+
+func TestHarnessAbortSettlesPlannedToolWithoutExecutingIt(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemorySessionRepo(SessionCodecOptions{})
+	session, err := repo.Create(ctx, SessionCreateOptions{ID: t.Name()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness, _, err := NewHarness(ctx, AgentHarnessOptions{Session: session, Models: &scriptedModels{}, Model: Model{Provider: "provider", ModelID: "model"}, ActiveToolNames: []string{"echo"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := session.View("main").AppendMessage(ctx, AgentMessage{Role: "user", Content: "prompt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opID := seedRunOperation(t, session, RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationNeedAssistant}}}, &source)
+	assistant, err := session.View("main").AppendMessage(ctx, AgentMessage{Role: "assistant", StopReason: StopReasonToolUse, ToolCalls: []AgentToolCall{{ID: "call", Name: "echo", Arguments: map[string]JSONValue{"value": "unused"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultID := session.IDGenerator().Next()
+	stateRegister, err := session.GetRegister(ctx, RegisterOpState, opID)
+	if err != nil || stateRegister == nil {
+		t.Fatalf("tool operation state = %v %+v", err, stateRegister)
+	}
+	state := stateRegister.Value.(OperationState)
+	state.Run.Phase = RunPhase{Kind: PhaseTools, ToolBatch: &ToolBatch{AssistantEntryID: assistant, Configuration: LaneConfiguration{Model: Model{Provider: "provider", ModelID: "model"}, ActiveToolNames: []string{"echo"}}, StepID: "step", TurnID: "turn", Calls: []ToolCall{{Status: "planned", SourceIndex: 0, ResultEntryID: resultID}}}}
+	if _, err := session.Commit(ctx, Transaction{Writes: []Write{registerSet(RegisterLaneLeaf, "main", &assistant), registerSet(RegisterOpState, opID, state)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.runtimeLane.Abort(ctx); err != nil {
+		t.Fatal(err)
+	}
+	result, err := harness.runtimeLane.Resume(ctx)
+	if err != nil || !result.OK || result.Value.Run == nil || result.Value.Run.Kind != "aborted" {
+		t.Fatalf("planned tool abort = %v %+v", err, result)
+	}
+	entries, err := session.FindEntries(ctx, EntryQuery{Order: OldestFirst})
+	if err != nil || len(entries) != 3 || entries[2].ID != resultID || entries[2].Message == nil || !entries[2].Message.Metadata["isError"].(bool) {
+		t.Fatalf("planned tool entries = %v %+v", err, entries)
+	}
+}
+
+func TestHarnessFailureDrainAppliesWritesAndRevivesOnInput(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemorySessionRepo(SessionCodecOptions{})
+	session, err := repo.Create(ctx, SessionCreateOptions{ID: t.Name()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	models := &scriptedModels{}
+	harness, _, err := NewHarness(ctx, AgentHarnessOptions{Session: session, Models: models, Model: Model{Provider: "provider", ModelID: "model"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := session.IDGenerator().Next()
+	if _, err := session.View("main").AppendMessage(ctx, AgentMessage{Role: "user", Content: "source"}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := session.FindEntries(ctx, EntryQuery{Order: OldestFirst})
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("source entry = %v %+v", err, entries)
+	}
+	source = entries[0].ID
+	opID := seedRunOperation(t, session, RunPhase{Kind: PhaseFailureDrain, Error: &OperationError{Code: "provider", Message: "temporary"}, Provenance: &FailureProvenance{Kind: "assistant", EntryID: source}}, &source)
+	writeID := session.IDGenerator().Next()
+	steerID := session.IDGenerator().Next()
+	stateRegister, err := session.GetRegister(ctx, RegisterOpState, opID)
+	if err != nil || stateRegister == nil {
+		t.Fatalf("failure state = %v %+v", err, stateRegister)
+	}
+	state := stateRegister.Value.(OperationState)
+	state.Run.Inbox.Writes = []string{writeID}
+	state.Run.Inbox.Steer = []string{steerID}
+	if _, err := session.Commit(ctx, Transaction{Writes: []Write{
+		registerSet(RegisterPendingEntry, writeID, PendingEntry{Type: EntryCustom, CustomType: "marker", Payload: map[string]JSONValue{"ok": true}}),
+		registerSet(RegisterPendingEntry, steerID, PendingEntry{Type: EntryMessage, Payload: AgentMessage{Role: "user", Content: "revive"}}),
+		registerSet(RegisterOpState, opID, state),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := harness.Resume(ctx)
+	if err != nil || !result.OK || result.Value.Run == nil || result.Value.Run.Kind != "completed" {
+		t.Fatalf("failure drain revival = %v %+v", err, result)
+	}
+	entries, err = session.FindEntries(ctx, EntryQuery{Order: OldestFirst})
+	if err != nil || len(entries) != 4 || entries[1].ID != writeID || entries[1].CustomType != "marker" || entries[2].ID != steerID {
+		t.Fatalf("failure drain entries = %v %+v", err, entries)
+	}
+}
+
+func TestHarnessCancelledWritesSurviveUntilTerminalCleanup(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemorySessionRepo(SessionCodecOptions{})
+	session, err := repo.Create(ctx, SessionCreateOptions{ID: t.Name()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness, _, err := NewHarness(ctx, AgentHarnessOptions{Session: session, Models: &scriptedModels{}, Model: Model{Provider: "provider", ModelID: "model"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedRunOperation(t, session, RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationNeedAssistant}}}, nil)
+	id, err := harness.runtimeLane.Session().AppendCustomEntry(ctx, "deferred", map[string]JSONValue{"value": "kept"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.runtimeLane.Abort(ctx); err != nil {
+		t.Fatal(err)
+	}
+	result, err := harness.runtimeLane.Resume(ctx)
+	if err != nil || !result.OK || result.Value.Run == nil || result.Value.Run.Kind != "aborted" {
+		t.Fatalf("cancelled write resume = %v %+v", err, result)
+	}
+	entries, err := session.FindEntries(ctx, EntryQuery{Order: OldestFirst})
+	if err != nil || len(entries) != 2 || entries[1].ID != id || entries[1].CustomType != "deferred" {
+		t.Fatalf("cancelled write entries = %v %+v", err, entries)
+	}
+	if register, err := session.GetRegister(ctx, RegisterPendingEntry, id); err != nil || register != nil {
+		t.Fatalf("cancelled write register = %v %+v", err, register)
+	}
+}
+
+func TestHarnessCloseStopsNewWorkAndPreservesAcceptedState(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemorySessionRepo(SessionCodecOptions{})
+	session, err := repo.Create(ctx, SessionCreateOptions{ID: t.Name()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := session.Metadata()
+	harness, _, err := NewHarness(ctx, AgentHarnessOptions{Session: session, Models: &scriptedModels{}, Model: Model{Provider: "provider", ModelID: "model"}, Drive: "manual"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan Result[RunOutcome, error], 1)
+	go func() {
+		result, _ := harness.Prompt(ctx, PromptInput{Text: "accepted"})
+		done <- result
+	}()
+	waitForAction(t, harness)
+	if err := harness.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	result := <-done
+	if result.OK || result.Err == nil {
+		t.Fatalf("closed prompt = %+v", result)
+	}
+	rejected, err := harness.Prompt(ctx, PromptInput{Text: "rejected"})
+	if err != nil || rejected.Err == nil {
+		t.Fatalf("closed new prompt = %v %+v", err, rejected)
+	}
+	reopened, err := repo.Open(ctx, metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored, err := Restore(ctx, reopened, "main"); err != nil || restored.Current == nil {
+		t.Fatalf("accepted state after close = %v %+v", err, restored)
+	}
+}
+
+func TestHarnessDriveResolvesExternallyFinalizedOperation(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemorySessionRepo(SessionCodecOptions{})
+	session, err := repo.Create(ctx, SessionCreateOptions{ID: t.Name()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness, _, err := NewHarness(ctx, AgentHarnessOptions{Session: session, Models: &scriptedModels{}, Model: Model{Provider: "provider", ModelID: "model"}, Drive: "manual"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan Result[RunOutcome, error], 1)
+	go func() {
+		result, _ := harness.Prompt(ctx, PromptInput{Text: "externally finalized"})
+		done <- result
+	}()
+	waitForAction(t, harness)
+	restored, err := Restore(ctx, session, "main")
+	if err != nil || restored.Current == nil {
+		t.Fatalf("restore before external finalization = %v %+v", err, restored)
+	}
+	current := restored.Current
+	laneState := current.LaneState
+	laneState.CurrentOperationID = nil
+	if _, err := session.Commit(ctx, Transaction{Writes: []Write{
+		registerDelete(RegisterOpMeta, current.Operation.OperationID),
+		registerDelete(RegisterOpState, current.Operation.OperationID),
+		registerSet(RegisterLaneLastResult, "main", LaneLastResult{OperationID: current.Operation.OperationID, Kind: OperationRun, Outcome: "completed", LeafID: current.LeafID}),
+		registerSet(RegisterLaneState, "main", laneState),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.ExecuteAction(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-done:
+		if !result.OK || result.Value.Kind != "completed" {
+			t.Fatalf("external finalization result = %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("drive did not stop after external finalization")
 	}
 }
