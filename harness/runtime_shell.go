@@ -352,6 +352,12 @@ func operationEntryInventory(operation Operation, state OperationState) ([]strin
 	if state.Navigation != nil && state.Navigation.TargetID != nil {
 		add(state.Navigation.TargetID)
 	}
+	if state.Navigation != nil && state.Navigation.Phase.Structural != nil && state.Navigation.Phase.Structural.Generation != nil {
+		id := state.Navigation.Phase.Structural.Generation.Context.ResultEntryID
+		if id != "" {
+			optional = append(optional, id)
+		}
+	}
 	return ids, optional
 }
 
