@@ -267,9 +267,10 @@ type AgentHarnessOptions struct {
 }
 
 type LaneInfo struct {
-	Name      string         `json:"name"`
-	LeafID    *string        `json:"leafId,omitempty"`
-	Operation *OperationInfo `json:"operation,omitempty"`
+	Name      string              `json:"name"`
+	LeafID    *string             `json:"leafId,omitempty"`
+	Operation *OperationInfo      `json:"operation,omitempty"`
+	Suspended *SuspendedOperation `json:"suspended,omitempty"`
 }
 
 type OperationInfo struct {

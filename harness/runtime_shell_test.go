@@ -103,6 +103,22 @@ func TestManualSchedulerAndRuntimePrimitives(t *testing.T) {
 	wg.Wait()
 }
 
+func TestEventBusReportsPassiveHandlerErrors(t *testing.T) {
+	ctx := context.Background()
+	bus := NewEventBus()
+	var got []string
+	bus.On(string(EventHandlerError), func(_ context.Context, event HarnessEvent) { got = append(got, event.Type) })
+	bus.On("message", func(context.Context, HarnessEvent) { panic("handler failed") })
+	bus.Emit(ctx, HarnessEvent{Type: "message", Lane: "main", Payload: "private"})
+	if !reflect.DeepEqual(got, []string{string(EventHandlerError)}) {
+		t.Fatalf("handler error events = %v", got)
+	}
+	buffered := bus.Drain()
+	if len(buffered) != 2 || buffered[1].Type != string(EventHandlerError) || buffered[1].Lane != "main" {
+		t.Fatalf("handler error buffer = %+v", buffered)
+	}
+}
+
 func TestLaneMutationCASAndNestedManualGate(t *testing.T) {
 	ctx := context.Background()
 	repo := NewMemorySessionRepo(SessionCodecOptions{})

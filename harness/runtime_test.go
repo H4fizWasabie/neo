@@ -379,6 +379,50 @@ func TestHarnessRetriesProviderErrorsWithCapturedPolicy(t *testing.T) {
 	}
 }
 
+func TestHarnessWatchBuffersEventsAfterSnapshot(t *testing.T) {
+	harness, session := newRetryHarness(t, &retryModels{outcomes: []retryOutcome{{message: AgentMessage{Role: "assistant", Content: "answer", StopReason: StopReasonStop}}}}, RetryPolicy{})
+	watch, err := harness.Watch(context.Background())
+	if err != nil || len(watch.Snapshot.Transcript) != 0 {
+		t.Fatalf("watch snapshot = %v %+v", err, watch.Snapshot)
+	}
+	if result, err := harness.Prompt(context.Background(), PromptInput{Text: "prompt"}); err != nil || !result.OK {
+		t.Fatalf("watched prompt = %v %+v", err, result)
+	}
+	var events []string
+	watch.Start(func(event HarnessEvent) { events = append(events, event.Type) })
+	watch.Unsubscribe()
+	if len(events) == 0 || events[0] != string(EventRunStart) || events[len(events)-1] != string(EventRunEnd) {
+		t.Fatalf("watch event order = %+v", events)
+	}
+	if entries, err := session.FindEntries(context.Background(), EntryQuery{Order: OldestFirst}); err != nil || len(entries) != 2 {
+		t.Fatalf("watched entries = %v %+v", err, entries)
+	}
+}
+
+func TestHarnessRestoresAllPersistedLanes(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemorySessionRepo(SessionCodecOptions{})
+	session, err := repo.Create(ctx, SessionCreateOptions{ID: "session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := LaneConfiguration{Model: Model{Provider: "provider", ModelID: "model"}, ThinkingLevel: ThinkingLow, ActiveToolNames: []string{}}
+	if err := session.(*MemorySession).CreateLane(ctx, "branch", nil, config); err != nil {
+		t.Fatal(err)
+	}
+	harness, _, err := NewHarness(ctx, AgentHarnessOptions{Session: session, Models: &scriptedModels{}, Model: config.Model})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lanes, err := harness.Lanes(ctx)
+	if err != nil || len(lanes) != 2 || lanes[0].Name != "branch" || lanes[1].Name != "main" {
+		t.Fatalf("restored lanes = %v %+v", err, lanes)
+	}
+	if _, err := harness.Lane(ctx, "branch"); err != nil {
+		t.Fatalf("restored branch lookup = %v", err)
+	}
+}
+
 func TestHarnessPreservesProviderErrorResponseAndUsage(t *testing.T) {
 	models := &retryModels{outcomes: []retryOutcome{{message: AgentMessage{Role: "assistant", Content: "quota exceeded", StopReason: StopReasonError, Usage: &Usage{Input: 4, Output: 1, Total: 5}}}}}
 	harness, session := newRetryHarness(t, models, RetryPolicy{})

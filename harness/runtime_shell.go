@@ -91,21 +91,6 @@ type SettlementOutput struct {
 	Terminate  bool
 }
 
-type SummaryRequestPlan struct {
-	TaskID           string
-	Attempt          int
-	RequestIndex     int
-	UsageID          string
-	Configuration    LaneConfiguration
-	Messages         []AgentMessage
-	TelemetryContext TelemetryContext
-}
-
-type SummaryRequestOutput struct {
-	Kind    string
-	Message *AgentMessage
-}
-
 type SettlementResult struct {
 	Current             CurrentOperation
 	Dispatch            *EffectPlan
@@ -152,9 +137,6 @@ type Effects interface {
 	CommitTransition(context.Context, CurrentOperation, OperationState, TelemetryContext, *int64, *int64) (*CurrentOperation, error)
 	CommitEffectSettlement(context.Context, CurrentOperation, EffectPlan, SettlementOutput, TelemetryContext) (SettlementResult, error)
 	CommitTerminal(context.Context, CurrentOperation, OperationResult) (*CurrentOperation, error)
-	FinalizeTool(context.Context, EffectPlan, EffectOutput) (SettlementOutput, error)
-	RunSummaryRequest(context.Context, SummaryRequestPlan) (SummaryRequestOutput, error)
-	SettleSummaryRequest(context.Context, CurrentOperation, SummaryRequestPlan, *AgentMessage, TelemetryContext) (CurrentOperation, error)
 	Run(context.Context, EffectPlan) (EffectOutput, error)
 	Sleep(context.Context, int64, TelemetryContext) error
 }
@@ -935,10 +917,15 @@ type EventBus struct {
 	nextID    int
 	listeners map[string]map[int]func(context.Context, HarnessEvent)
 	buffer    []HarnessEvent
+	telemetry TelemetryContext
 }
 
-func NewEventBus() *EventBus {
-	return &EventBus{listeners: make(map[string]map[int]func(context.Context, HarnessEvent))}
+func NewEventBus(telemetry ...TelemetryContext) *EventBus {
+	var telemetryContext TelemetryContext
+	if len(telemetry) != 0 {
+		telemetryContext = telemetry[0]
+	}
+	return &EventBus{listeners: make(map[string]map[int]func(context.Context, HarnessEvent)), telemetry: telemetryContext}
 }
 
 func (b *EventBus) On(eventType string, listener func(context.Context, HarnessEvent)) func() {
@@ -978,9 +965,50 @@ func (b *EventBus) Emit(ctx context.Context, event HarnessEvent) {
 	}
 	b.mu.Unlock()
 	for _, listener := range listeners {
+		var recovered any
+		invoke := func() {
+			defer func() { recovered = recover() }()
+			listener(ctx, cloneEvent(event))
+		}
+		if b.telemetry != nil {
+			_ = safeTelemetry(b.telemetry, ctx, SpanOptions{Name: SpanHarnessEventHandler, Attributes: map[string]AttributeValue{"event.type": event.Type, "event.lane": event.Lane}}, func(TelemetrySpan) error {
+				invoke()
+				return nil
+			})
+		} else {
+			invoke()
+		}
+		if recovered != nil {
+			b.emitHandlerError(ctx, event, recovered)
+		}
+	}
+}
+
+func safeTelemetry(telemetry TelemetryContext, ctx context.Context, options SpanOptions, fn func(TelemetrySpan) error) (err error) {
+	defer func() { _ = recover() }()
+	return telemetry.StartSpan(ctx, options, fn)
+}
+
+func (b *EventBus) emitHandlerError(ctx context.Context, event HarnessEvent, cause any) {
+	handlerError := HarnessEvent{Type: string(EventHandlerError), Lane: event.Lane, Payload: map[string]JSONValue{"error": fmt.Sprint(cause), "eventType": event.Type}}
+	b.mu.Lock()
+	b.buffer = append(b.buffer, cloneEvent(handlerError))
+	listeners := make([]func(context.Context, HarnessEvent), 0)
+	for _, eventType := range []string{handlerError.Type, "*"} {
+		ids := make([]int, 0, len(b.listeners[eventType]))
+		for id := range b.listeners[eventType] {
+			ids = append(ids, id)
+		}
+		sort.Ints(ids)
+		for _, id := range ids {
+			listeners = append(listeners, b.listeners[eventType][id])
+		}
+	}
+	b.mu.Unlock()
+	for _, listener := range listeners {
 		func() {
 			defer func() { _ = recover() }()
-			listener(ctx, cloneEvent(event))
+			listener(ctx, cloneEvent(handlerError))
 		}()
 	}
 }
