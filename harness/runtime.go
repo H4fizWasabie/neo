@@ -672,6 +672,18 @@ func (e *runtimeEffects) CommitTransition(ctx context.Context, current CurrentOp
 	}
 	var commit CommitResult
 	if err := e.harness.line(e.lane.name).Do(ctx, func() error {
+		if expectedConfigurationSeq != nil {
+			config, err := e.harness.session.GetRegister(ctx, RegisterLaneConfig, e.lane.name)
+			if err != nil {
+				return err
+			}
+			if config == nil || config.Seq != *expectedConfigurationSeq {
+				return fmt.Errorf("stale lane configuration")
+			}
+		}
+		if expectedSettingsRevision != nil && e.harness.settings.Snapshot().SettingsRevision != *expectedSettingsRevision {
+			return fmt.Errorf("stale settings revision")
+		}
 		valid, err := e.current(ctx, current)
 		if err != nil || !valid {
 			if err == nil {
@@ -1110,7 +1122,7 @@ func (h *Harness) GetStreamOptions(context.Context) (AgentHarnessStreamOptions, 
 	return h.settings.Snapshot().StreamOptions, nil
 }
 func (h *Harness) SetStreamOptions(_ context.Context, options AgentHarnessStreamOptions) error {
-	h.settings.Update(options, h.settings.Snapshot().RetryPolicy)
+	h.settings.UpdateStream(options)
 	return nil
 }
 func (h *Harness) GetRetryPolicy(context.Context) (RetryPolicy, error) {
@@ -1118,7 +1130,7 @@ func (h *Harness) GetRetryPolicy(context.Context) (RetryPolicy, error) {
 	return RetryPolicy{Enabled: snapshot.RetryPolicy.MaxAttempts > 1, MaxRetries: snapshot.RetryPolicy.MaxAttempts - 1, BaseDelayMs: snapshot.RetryPolicy.BaseDelayMs}, nil
 }
 func (h *Harness) SetRetryPolicy(_ context.Context, policy RetryPolicy) error {
-	h.settings.Update(h.settings.Snapshot().StreamOptions, NormalizedRetryPolicy{MaxAttempts: policy.MaxRetries + 1, BaseDelayMs: policy.BaseDelayMs})
+	h.settings.UpdateRetry(NormalizedRetryPolicy{MaxAttempts: policy.MaxRetries + 1, BaseDelayMs: policy.BaseDelayMs})
 	return nil
 }
 func (h *Harness) GetCompactionSettings(context.Context) (CompactionSettings, error) {
