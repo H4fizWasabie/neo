@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 )
@@ -20,6 +21,7 @@ type Harness struct {
 	tools              []AgentHarnessTool
 	toolContext        AgentHarnessToolContextSource
 	resources          Resources
+	entryProjectors    map[string]EntryProjector
 	compaction         CompactionSettings
 	steeringMode       QueueMode
 	followUpMode       QueueMode
@@ -104,6 +106,7 @@ func NewHarness(ctx context.Context, options AgentHarnessOptions) (*Harness, []S
 		tools:              append([]AgentHarnessTool(nil), options.Tools...),
 		toolContext:        options.ToolContext,
 		resources:          cloneValue(options.Resources).(Resources),
+		entryProjectors:    options.EntryProjectors,
 		compaction:         options.Compaction,
 		steeringMode:       options.SteeringMode,
 		followUpMode:       options.FollowUpMode,
@@ -621,6 +624,9 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 		if phase.Kind == PhaseTools {
 			return h.driveTools(ctx, lane, operation, current)
 		}
+		if phase.Kind == PhaseCompaction {
+			return h.driveRunCompaction(ctx, lane, operation, current)
+		}
 		if phase.Kind == PhaseDeferred {
 			return h.driveDeferred(ctx, lane, operation, current)
 		}
@@ -638,6 +644,13 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 					state = next.State
 					continue
 				}
+			}
+			started, err := h.maybeStartThresholdCompaction(ctx, lane, operation, current)
+			if err != nil {
+				return RunOutcome{}, err
+			}
+			if started {
+				continue
 			}
 			if phase.Checkpoint.Continuation.Kind == ContinuationMayFinish {
 				if !phase.Checkpoint.Continuation.IncludeFinalAssistant {
@@ -662,7 +675,7 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 			}
 			config := current.Configuration
 			settings := h.settings.Snapshot()
-			generation := &Generation{Status: GenerationReady, NextAttempt: 1, Context: GenerationContext{StepID: operation.OperationID + ":step:1", TriggerEntryID: phase.Checkpoint.TriggerEntryID, Configuration: config, StreamOptions: settings.StreamOptions, RetryPolicy: settings.RetryPolicy}}
+			generation := &Generation{Status: GenerationReady, NextAttempt: 1, Context: GenerationContext{StepID: operation.OperationID + ":step:1", TriggerEntryID: phase.Checkpoint.TriggerEntryID, Configuration: config, StreamOptions: settings.StreamOptions, RetryPolicy: settings.RetryPolicy, OverflowRecoveryUsed: phase.Checkpoint.Continuation.OverflowRecoveryUsed}}
 			next := state
 			next.Run.Phase = RunPhase{Kind: PhaseAssistant, Generation: generation}
 			var transition *CurrentOperation
@@ -767,6 +780,8 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 		pending.Run.Phase.Generation.NextAttempt = attempt
 		pending.Run.Phase.Generation.ResponseEntryID = responseID
 		pending.Run.Phase.Generation.UsageID = usageID
+		pending.Run.Phase.Generation.IntendedOutputLimit = generation.Context.Configuration.Model.OutputLimit
+		pending.Run.Phase.Generation.ContextWindow = generation.Context.Configuration.Model.ContextWindow
 		pending.Run.Phase.Generation.AttemptStreamOptions = &requestOptions
 		var transition *CurrentOperation
 		if err := h.effect(ctx, ActionInfo{Kind: "transition", Description: "assistant effect pending"}, func(ctx context.Context) error {
@@ -783,7 +798,7 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 			return RunOutcome{}, fmt.Errorf("assistant intent lost its compare-and-swap")
 		}
 		current = *transition
-		message, err := h.runAssistantAttempt(ctx, lane, operation, pending, fx)
+		message, err := h.runAssistantAttempt(ctx, lane, operation, pending, current.LeafID, fx)
 		if err != nil {
 			latest, reloadErr := h.currentOperation(ctx, lane)
 			if reloadErr == nil && latest.State.Run != nil && latest.State.Run.Control.Status == ControlCancelRequested {
@@ -791,6 +806,9 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 			}
 			if isOperationMissing(reloadErr) {
 				return h.resolveExternalFinalization(ctx, lane, operation)
+			}
+			if overflow, reason := overflowError(err); overflow {
+				return h.settleGenerationOverflow(ctx, lane, operation, current, *pending.Run.Phase.Generation, AgentMessage{Role: "assistant", Content: reason}, reason)
 			}
 			return h.settleGenerationError(ctx, lane, operation, current, *pending.Run.Phase.Generation, err)
 		}
@@ -809,7 +827,13 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 			return RunOutcome{}, h.lifecycle.Fault(fmt.Errorf("provider returned aborted while control is running"))
 		}
 		if message.StopReason == StopReasonError {
+			if overflow, reason := overflowMessage(message, *pending.Run.Phase.Generation); overflow {
+				return h.settleGenerationOverflow(ctx, lane, operation, current, *pending.Run.Phase.Generation, message, reason)
+			}
 			return h.settleGenerationErrorMessage(ctx, lane, operation, current, *pending.Run.Phase.Generation, message, fmt.Errorf("provider returned an error"))
+		}
+		if overflow, reason := overflowMessage(message, *pending.Run.Phase.Generation); overflow {
+			return h.settleGenerationOverflow(ctx, lane, operation, current, *pending.Run.Phase.Generation, message, reason)
 		}
 		if message.StopReason == StopReasonDeferred {
 			handle, ok := deferredHandle(message)
@@ -839,6 +863,75 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 		}
 		return h.drive(ctx, lane, operation, settled.State)
 	}
+}
+
+func (h *Harness) maybeStartThresholdCompaction(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation) (bool, error) {
+	run := current.State.Run
+	if run == nil || run.Phase.Checkpoint == nil || run.Phase.Checkpoint.Continuation.Kind != ContinuationNeedAssistant || !run.Settings.Compaction.Enabled {
+		return false, nil
+	}
+	trigger := run.Phase.Checkpoint.TriggerEntryID
+	if trigger == "" || run.Phase.Checkpoint.ThresholdCheckedTriggerEntryID == trigger || current.Configuration.Model.ContextWindow <= 0 {
+		return false, nil
+	}
+	start := current.LeafID
+	if start == nil {
+		start = &trigger
+	}
+	entries, err := lane.view.FindEntriesOnBranch(ctx, BranchScan{Start: *start, Order: OldestFirst})
+	if err != nil {
+		return false, err
+	}
+	tokens := 0
+	for _, entry := range entries {
+		if entry.Message != nil && includeInContext(*entry.Message) {
+			tokens += estimateMessageTokens(*entry.Message)
+		}
+	}
+	if int64(tokens)+run.Settings.Compaction.ReserveTokens < current.Configuration.Model.ContextWindow {
+		return false, nil
+	}
+	prep, hasPreparation, err := h.buildCompactionPreparation(ctx, lane, current.LeafID, run.Settings.Compaction)
+	if err != nil {
+		return false, err
+	}
+	next := current.State
+	marked := *run.Phase.Checkpoint
+	marked.ThresholdCheckedTriggerEntryID = trigger
+	if !hasPreparation {
+		next.Run.Phase.Checkpoint = &marked
+	} else {
+		taskID := "task:threshold:" + trigger
+		next.Run.Phase = RunPhase{Kind: PhaseCompaction, Reason: "threshold", Structural: &StructuralDecision{TaskID: taskID, Status: "deciding"}, ResumeAfter: &marked}
+	}
+	writes := []Write{registerSet(RegisterOpState, operation.OperationID, next)}
+	if hasPreparation {
+		writes = append([]Write{registerSet(RegisterOpPreparation, operation.OperationID+":"+next.Run.Phase.Structural.TaskID, prep)}, writes...)
+	}
+	if err := h.effect(ctx, ActionInfo{Kind: "transition", Description: "threshold compaction"}, func(ctx context.Context) error {
+		return h.line(lane.name).Do(ctx, func() error {
+			valid, err := (&runtimeEffects{harness: h, lane: lane}).current(ctx, current)
+			if err != nil || !valid {
+				if err == nil {
+					err = errOperationMissing
+				}
+				return err
+			}
+			_, err = h.session.Commit(ctx, Transaction{Writes: writes})
+			return err
+		})
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func estimateMessageTokens(message AgentMessage) int {
+	text := fmt.Sprint(message.Content)
+	if len(text) < 4 {
+		return 1
+	}
+	return (len(text) + 3) / 4
 }
 
 func (h *Harness) driveDeferred(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation) (RunOutcome, error) {
@@ -1227,10 +1320,14 @@ type compactionDecision struct {
 }
 
 func (h *Harness) runCompactionHook(ctx context.Context, lane *runtimeLane, operation Operation, preparation DurableStructuralPreparation, customInstructions string) (compactionDecision, error) {
+	return h.runCompactionHookReason(ctx, lane, operation, preparation, customInstructions, "manual")
+}
+
+func (h *Harness) runCompactionHookReason(ctx context.Context, lane *runtimeLane, operation Operation, preparation DurableStructuralPreparation, customInstructions, reason string) (compactionDecision, error) {
 	var result JSONValue
 	err := h.effect(ctx, ActionInfo{Kind: "hook", Description: "before_compaction"}, func(ctx context.Context) error {
 		var err error
-		result, err = h.hooks.Run(ctx, HookInvocation{Name: HookBeforeCompaction, Lane: lane.name, RunID: operation.OperationID, Event: map[string]JSONValue{"reason": "manual", "preparation": compactionPreparation(preparation), "customInstructions": customInstructions}})
+		result, err = h.hooks.Run(ctx, HookInvocation{Name: HookBeforeCompaction, Lane: lane.name, RunID: operation.OperationID, Event: map[string]JSONValue{"reason": reason, "preparation": compactionPreparation(preparation), "customInstructions": customInstructions}})
 		return err
 	})
 	if err != nil {
@@ -1454,6 +1551,253 @@ func (h *Harness) runDeferredPoll(ctx context.Context, lane *runtimeLane, operat
 		return DeferredResponse{}, terminalGenerationError{err}
 	}
 	return response, nil
+}
+
+func (h *Harness) driveRunCompaction(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation) (RunOutcome, error) {
+	run := current.State.Run
+	if run == nil || run.Phase.Structural == nil {
+		return RunOutcome{}, fmt.Errorf("run compaction state is missing")
+	}
+	structural := run.Phase.Structural
+	prepRegister, err := h.session.GetRegister(ctx, RegisterOpPreparation, operation.OperationID+":"+structural.TaskID)
+	if err != nil || prepRegister == nil {
+		if err == nil {
+			err = fmt.Errorf("run compaction preparation is missing")
+		}
+		return RunOutcome{}, err
+	}
+	prep, ok := prepRegister.Value.(DurableStructuralPreparation)
+	if !ok || prep.Kind != EntryCompaction {
+		return RunOutcome{}, fmt.Errorf("run compaction preparation has invalid type")
+	}
+	if run.Control.Status == ControlCancelRequested {
+		return h.finishOutcome(ctx, lane, operation, current, RunOutcome{Kind: "aborted", RunID: operation.OperationID, LeafID: current.LeafID, FinalEntryID: run.LatestAssistantEntryID, Reason: "cancelled"})
+	}
+	if structural.Status == "deciding" {
+		decision, err := h.runCompactionHookReason(ctx, lane, operation, prep, operation.Intent.CustomInstructions, string(run.Phase.Reason))
+		if err != nil {
+			return h.settleRunCompactionFailure(ctx, lane, operation, current, err)
+		}
+		if decision.decline {
+			if run.Phase.Reason == "threshold" {
+				return h.resumeRunAfterCompaction(ctx, lane, operation, current)
+			}
+			return h.settleRunCompactionFailure(ctx, lane, operation, current, fmt.Errorf("overflow compaction was declined"))
+		}
+		if decision.result != nil {
+			return h.settleRunCompactionResult(ctx, lane, operation, current, prep, *decision.result, nil)
+		}
+		settings := h.settings.Snapshot()
+		resultID := h.session.IDGenerator().Next()
+		next := current.State
+		next.Run.Phase.Structural.Status = "generating"
+		next.Run.Phase.Structural.Generation = &SummaryGeneration{Status: GenerationReady, NextAttempt: 1, Context: SummaryContext{TaskID: structural.TaskID, ResultEntryID: resultID, Kind: EntryCompaction, Configuration: current.Configuration, StreamOptions: settings.StreamOptions, RetryPolicy: settings.RetryPolicy, Reason: run.Phase.Reason}, UsageIDs: []string{}}
+		var transition *CurrentOperation
+		fx := &runtimeEffects{harness: h, lane: lane}
+		if err := h.effect(ctx, ActionInfo{Kind: "transition", Description: "run compaction generating"}, func(ctx context.Context) error {
+			var err error
+			transition, err = fx.CommitTransition(ctx, current, next, h.telemetry, &current.ConfigurationSeq, nil)
+			return err
+		}); err != nil {
+			return RunOutcome{}, err
+		}
+		if transition == nil {
+			return RunOutcome{}, fmt.Errorf("run compaction decision lost its compare-and-swap")
+		}
+		return h.driveRunCompaction(ctx, lane, operation, *transition)
+	}
+	if structural.Status != "generating" || structural.Generation == nil {
+		return RunOutcome{}, fmt.Errorf("unsupported run compaction status %q", structural.Status)
+	}
+	generation := *structural.Generation
+	if generation.Status == GenerationEffectPending {
+		if generation.Attempt >= generation.Context.RetryPolicy.MaxAttempts {
+			return h.settleRunCompactionFailure(ctx, lane, operation, current, fmt.Errorf("recovered overflow compaction reached retry cap"))
+		}
+		next := current.State
+		next.Run.Phase.Structural.Generation.Status = GenerationReady
+		next.Run.Phase.Structural.Generation.NextAttempt = generation.Attempt + 1
+		next.Run.Phase.Structural.Generation.Attempt = 0
+		next.Run.Phase.Structural.Generation.Request = nil
+		if err := h.effect(ctx, ActionInfo{Kind: "recovery", Description: "recover run compaction"}, func(ctx context.Context) error {
+			return h.line(lane.name).Do(ctx, func() error {
+				_, err := h.session.Commit(ctx, Transaction{Writes: []Write{registerSet(RegisterOpState, operation.OperationID, next)}})
+				return err
+			})
+		}); err != nil {
+			return RunOutcome{}, err
+		}
+		return h.driveRunCompaction(ctx, lane, operation, nextCurrent(current, next))
+	}
+	if generation.Status != GenerationReady {
+		return RunOutcome{}, fmt.Errorf("unsupported run compaction generation status %q", generation.Status)
+	}
+	attempt := generation.NextAttempt
+	if attempt == 0 {
+		attempt = generation.Attempt + 1
+	}
+	options := generation.Context.StreamOptions
+	options.Deferred = false
+	fx := &runtimeEffects{harness: h, lane: lane}
+	if err := h.runBeforeRequestStep(ctx, fx, operation, attempt, "compaction", fmt.Sprintf("%s:attempt:%d", generation.Context.TaskID, attempt), &options); err != nil {
+		return h.settleRunCompactionFailure(ctx, lane, operation, current, err)
+	}
+	options.Deferred = false
+	usageID := h.session.IDGenerator().Next()
+	next := current.State
+	next.Run.Phase.Structural.Generation.Status = GenerationEffectPending
+	next.Run.Phase.Structural.Generation.Attempt = attempt
+	next.Run.Phase.Structural.Generation.NextAttempt = attempt
+	next.Run.Phase.Structural.Generation.Request = &SummaryRequest{Index: len(generation.UsageIDs), UsageID: usageID}
+	var transition *CurrentOperation
+	if err := h.effect(ctx, ActionInfo{Kind: "transition", Description: "run compaction request pending"}, func(ctx context.Context) error {
+		var err error
+		transition, err = fx.CommitTransition(ctx, current, next, h.telemetry, nil, nil)
+		return err
+	}); err != nil {
+		return RunOutcome{}, err
+	}
+	if transition == nil {
+		return RunOutcome{}, fmt.Errorf("run compaction request lost its compare-and-swap")
+	}
+	current = *transition
+	generation = *current.State.Run.Phase.Structural.Generation
+	message, err := h.runSummaryAttempt(ctx, lane, operation, prep, generation, options, fx)
+	if err != nil {
+		latest, reloadErr := h.currentOperation(ctx, lane)
+		if reloadErr == nil && latest.State.Run != nil && latest.State.Run.Control.Status == ControlCancelRequested {
+			return h.finishOutcome(ctx, lane, operation, latest, RunOutcome{Kind: "aborted", RunID: operation.OperationID, LeafID: latest.LeafID, FinalEntryID: latest.State.Run.LatestAssistantEntryID, Reason: "cancelled"})
+		}
+		if isOperationMissing(reloadErr) {
+			return h.resolveExternalFinalization(ctx, lane, operation)
+		}
+		return h.settleRunCompactionAttemptFailure(ctx, lane, operation, current, generation, err)
+	}
+	latest, reloadErr := h.currentOperation(ctx, lane)
+	if reloadErr == nil && latest.State.Run != nil && latest.State.Run.Control.Status == ControlCancelRequested {
+		return h.finishOutcome(ctx, lane, operation, latest, RunOutcome{Kind: "aborted", RunID: operation.OperationID, LeafID: latest.LeafID, FinalEntryID: latest.State.Run.LatestAssistantEntryID, Reason: "cancelled"})
+	}
+	if isOperationMissing(reloadErr) {
+		return h.resolveExternalFinalization(ctx, lane, operation)
+	}
+	return h.settleRunCompactionResult(ctx, lane, operation, current, prep, CompactResult{Summary: summaryText(message), Usage: message.Usage}, generation.Request)
+}
+
+func (h *Harness) settleRunCompactionAttemptFailure(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation, generation SummaryGeneration, cause error) (RunOutcome, error) {
+	if cause == nil {
+		cause = fmt.Errorf("compaction failed")
+	}
+	if generation.Request == nil {
+		return h.settleRunCompactionFailure(ctx, lane, operation, current, cause)
+	}
+	next := current.State
+	if generation.Attempt < generation.Context.RetryPolicy.MaxAttempts {
+		next.Run.Phase.Structural.Generation.Status = GenerationRetryWait
+		next.Run.Phase.Structural.Generation.NextAttempt = generation.Attempt + 1
+		next.Run.Phase.Structural.Generation.NotBefore = retryNotBefore(time.Now().UnixMilli(), retryDelay(generation.Context.RetryPolicy, generation.Context.StreamOptions, generation.Attempt))
+		next.Run.Phase.Structural.Generation.Request = nil
+		next.Run.Phase.Structural.Generation.UsageIDs = append(append([]string(nil), generation.UsageIDs...), generation.Request.UsageID)
+	} else {
+		next.Run.Phase = RunPhase{Kind: PhaseFailureDrain, Error: &OperationError{Code: "compaction", Message: cause.Error()}, Provenance: &FailureProvenance{Kind: "structural", TaskID: current.State.Run.Phase.Structural.TaskID}}
+	}
+	writes := []Write{
+		{Kind: WriteUsage, Usage: &UsageWrite{Row: UsageRow{ID: generation.Request.UsageID, Usage: Usage{}}}},
+		registerSet(RegisterOpState, operation.OperationID, next),
+	}
+	if err := h.effect(ctx, ActionInfo{Kind: "settlement", Description: "run compaction failure"}, func(ctx context.Context) error {
+		return h.line(lane.name).Do(ctx, func() error {
+			valid, err := (&runtimeEffects{harness: h, lane: lane}).current(ctx, current)
+			if err != nil || !valid {
+				if err == nil {
+					err = errOperationMissing
+				}
+				return err
+			}
+			_, err = h.session.Commit(ctx, Transaction{Writes: writes})
+			return err
+		})
+	}); err != nil {
+		return RunOutcome{}, err
+	}
+	current.State = next
+	return h.drive(ctx, lane, operation, next)
+}
+
+func nextCurrent(current CurrentOperation, state OperationState) CurrentOperation {
+	current.State = state
+	return current
+}
+
+func (h *Harness) resumeRunAfterCompaction(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation) (RunOutcome, error) {
+	resume := current.State.Run.Phase.ResumeAfter
+	if resume == nil {
+		return h.settleRunCompactionFailure(ctx, lane, operation, current, fmt.Errorf("compaction has no resume checkpoint"))
+	}
+	next := current.State
+	next.Run.Phase = RunPhase{Kind: PhaseCheckpoint, Checkpoint: resume}
+	if err := h.effect(ctx, ActionInfo{Kind: "transition", Description: "restore checkpoint after compaction"}, func(ctx context.Context) error {
+		return h.line(lane.name).Do(ctx, func() error {
+			_, err := h.session.Commit(ctx, Transaction{Writes: []Write{registerSet(RegisterOpState, operation.OperationID, next)}})
+			return err
+		})
+	}); err != nil {
+		return RunOutcome{}, err
+	}
+	return h.drive(ctx, lane, operation, next)
+}
+
+func (h *Harness) settleRunCompactionResult(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation, prep DurableStructuralPreparation, result CompactResult, request *SummaryRequest) (RunOutcome, error) {
+	if result.Summary == "" {
+		return h.settleRunCompactionFailure(ctx, lane, operation, current, fmt.Errorf("compaction result has no summary"))
+	}
+	id := current.State.Run.Phase.Structural.Generation.Context.ResultEntryID
+	entry := Entry{EntryBase: EntryBase{ID: id, ParentID: cloneStringPointer(current.LeafID), Type: EntryCompaction}, Summary: result.Summary, RetainedTail: cloneValue(prep.RetainedTail).([]AgentMessage), TokensBefore: prep.TokensBefore, Usage: result.Usage, FromHook: request == nil}
+	next := current.State
+	next.Run.Phase = RunPhase{Kind: PhaseCheckpoint, Checkpoint: current.State.Run.Phase.ResumeAfter}
+	writes := []Write{{Kind: WriteEntry, Entry: &EntryWrite{Entry: entry}}, registerSet(RegisterLaneLeaf, lane.name, stringPointer(id))}
+	if request != nil {
+		writes = append(writes, Write{Kind: WriteUsage, Usage: &UsageWrite{Row: UsageRow{ID: request.UsageID, Usage: usageValue(result.Usage), EntryID: stringPointer(id)}}})
+	} else if result.Usage != nil {
+		writes = append(writes, Write{Kind: WriteUsage, Usage: &UsageWrite{Row: UsageRow{ID: h.session.IDGenerator().Next(), Usage: *result.Usage, EntryID: stringPointer(id)}}})
+	}
+	writes = append(writes, registerSet(RegisterOpState, operation.OperationID, next))
+	if err := h.effect(ctx, ActionInfo{Kind: "settlement", Description: "run compaction result"}, func(ctx context.Context) error {
+		return h.line(lane.name).Do(ctx, func() error {
+			valid, err := (&runtimeEffects{harness: h, lane: lane}).current(ctx, current)
+			if err != nil || !valid {
+				if err == nil {
+					err = errOperationMissing
+				}
+				return err
+			}
+			_, err = h.session.Commit(ctx, Transaction{Writes: writes})
+			return err
+		})
+	}); err != nil {
+		return RunOutcome{}, err
+	}
+	current.State = next
+	current.LeafID = stringPointer(id)
+	h.events.Emit(ctx, HarnessEvent{Type: string(EventEntryAdded), Lane: lane.name, Payload: cloneValue(entry)})
+	h.events.Emit(ctx, HarnessEvent{Type: string(EventUsage), Lane: lane.name, Payload: cloneValue(usageValue(result.Usage))})
+	return h.drive(ctx, lane, operation, next)
+}
+
+func (h *Harness) settleRunCompactionFailure(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation, cause error) (RunOutcome, error) {
+	if cause == nil {
+		cause = fmt.Errorf("compaction failed")
+	}
+	next := current.State
+	next.Run.Phase = RunPhase{Kind: PhaseFailureDrain, Error: &OperationError{Code: "compaction", Message: cause.Error()}, Provenance: &FailureProvenance{Kind: "structural", TaskID: current.State.Run.Phase.Structural.TaskID}}
+	if err := h.effect(ctx, ActionInfo{Kind: "transition", Description: "compaction failure drain"}, func(ctx context.Context) error {
+		return h.line(lane.name).Do(ctx, func() error {
+			_, err := h.session.Commit(ctx, Transaction{Writes: []Write{registerSet(RegisterOpState, operation.OperationID, next)}})
+			return err
+		})
+	}); err != nil {
+		return RunOutcome{}, err
+	}
+	return h.drive(ctx, lane, operation, next)
 }
 
 func (h *Harness) driveFailureDrain(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation) (RunOutcome, error) {
@@ -2195,7 +2539,7 @@ func (h *Harness) settleTool(ctx context.Context, lane *runtimeLane, operation O
 	return RunOutcome{}, nil
 }
 
-func (h *Harness) runAssistantAttempt(ctx context.Context, lane *runtimeLane, operation Operation, pending OperationState, fx *runtimeEffects) (AgentMessage, error) {
+func (h *Harness) runAssistantAttempt(ctx context.Context, lane *runtimeLane, operation Operation, pending OperationState, leaf *string, fx *runtimeEffects) (AgentMessage, error) {
 	generation := pending.Run.Phase.Generation
 	message := AgentMessage{Role: "assistant"}
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventMessageStart), Lane: lane.name, Payload: cloneValue(message)})
@@ -2206,15 +2550,16 @@ func (h *Harness) runAssistantAttempt(ctx context.Context, lane *runtimeLane, op
 		return AgentMessage{}, terminalGenerationError{err}
 	}
 	if err := h.effect(ctx, ActionInfo{Kind: "provider", Description: "assistant stream"}, func(ctx context.Context) error {
-		entries, err := lane.view.FindEntriesOnBranch(ctx, BranchScan{Start: generation.Context.TriggerEntryID, Order: OldestFirst})
+		if leaf == nil {
+			return fmt.Errorf("assistant context has no leaf")
+		}
+		entries, err := lane.view.FindEntriesOnBranch(ctx, BranchScan{Start: *leaf, Order: NewestFirst})
 		if err != nil {
 			return err
 		}
-		messages := make([]AgentMessage, 0, len(entries))
-		for _, entry := range entries {
-			if entry.Message != nil && includeInContext(*entry.Message) {
-				messages = append(messages, *entry.Message)
-			}
+		messages, err := ProjectContext(ctx, entries, h.entryProjectors)
+		if err != nil {
+			return err
 		}
 		if operation.Intent.SystemPromptOverride != "" {
 			messages = append([]AgentMessage{{Role: "system", Content: operation.Intent.SystemPromptOverride}}, messages...)
@@ -2381,7 +2726,7 @@ func (e *runtimeEffects) CommitEffectSettlement(ctx context.Context, current Cur
 	if message.Usage != nil {
 		usage = *message.Usage
 	}
-	entry := Entry{EntryBase: EntryBase{ID: responseID, ParentID: stringPointer(plan.Generation.Context.TriggerEntryID), Type: EntryMessage}, Message: messageCopy(message)}
+	entry := Entry{EntryBase: EntryBase{ID: responseID, ParentID: cloneStringPointer(current.LeafID), Type: EntryMessage}, Message: messageCopy(message)}
 	phase := output.Phase
 	if phase.Kind == "" {
 		phase = RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationMayFinish}, TriggerEntryID: responseID}}
@@ -3342,7 +3687,7 @@ func (h *Harness) settleGeneration(ctx context.Context, lane *runtimeLane, opera
 	if message.Usage != nil {
 		usage = *message.Usage
 	}
-	entry := Entry{EntryBase: EntryBase{ID: generation.ResponseEntryID, ParentID: stringPointer(generation.Context.TriggerEntryID), Type: EntryMessage}, Message: messageCopy(message)}
+	entry := Entry{EntryBase: EntryBase{ID: generation.ResponseEntryID, ParentID: cloneStringPointer(current.LeafID), Type: EntryMessage}, Message: messageCopy(message)}
 	var settlement SettlementResult
 	if err := h.effect(ctx, ActionInfo{Kind: "settlement", Description: "assistant response"}, func(ctx context.Context) error {
 		var err error
@@ -3429,6 +3774,113 @@ func (h *Harness) settleDeferred(ctx context.Context, lane *runtimeLane, operati
 		return RunOutcome{}, err
 	}
 	return RunOutcome{Kind: "suspended", RunID: operation.OperationID, LeafID: settled.LeafID, FinalEntryID: settled.LeafID, FinalMessage: &message, Reason: "deferred", Deferred: handle}, nil
+}
+
+func overflowError(err error) (bool, string) {
+	if err == nil {
+		return false, ""
+	}
+	text := strings.ToLower(err.Error())
+	for _, marker := range []string{"context window", "context length", "maximum context", "too many tokens", "token limit", "prompt is too long"} {
+		if strings.Contains(text, marker) {
+			return true, err.Error()
+		}
+	}
+	return false, ""
+}
+
+func overflowMessage(message AgentMessage, generation Generation) (bool, string) {
+	if message.StopReason == StopReasonError {
+		return overflowError(fmt.Errorf("%v", message.Content))
+	}
+	if message.StopReason == StopReasonLength && len(message.ToolCalls) == 0 && generation.IntendedOutputLimit > 0 && message.Usage != nil && message.Usage.Output < generation.IntendedOutputLimit {
+		return true, fmt.Sprintf("context window overflow after output limit %d", generation.IntendedOutputLimit)
+	}
+	return false, ""
+}
+
+func (h *Harness) buildCompactionPreparation(ctx context.Context, lane *runtimeLane, leaf *string, settings CompactionSettings) (DurableStructuralPreparation, bool, error) {
+	if leaf == nil {
+		return DurableStructuralPreparation{}, false, nil
+	}
+	entries, err := lane.view.FindEntriesOnBranch(ctx, BranchScan{Start: *leaf, Order: OldestFirst})
+	if err != nil {
+		return DurableStructuralPreparation{}, false, err
+	}
+	messages := make([]AgentMessage, 0, len(entries))
+	previousSummary := ""
+	for _, entry := range entries {
+		if entry.Type == EntryCompaction {
+			messages = nil
+			previousSummary = entry.Summary
+			continue
+		}
+		if entry.Message != nil && includeInContext(*entry.Message) {
+			messages = append(messages, *messageCopy(*entry.Message))
+		}
+	}
+	if len(messages) < 2 {
+		return DurableStructuralPreparation{}, false, nil
+	}
+	return DurableStructuralPreparation{Kind: EntryCompaction, MessagesToSummarize: append([]AgentMessage(nil), messages[:len(messages)-1]...), RetainedTail: []AgentMessage{messages[len(messages)-1]}, TokensBefore: int64(len(messages)), PreviousSummary: previousSummary, Settings: settings}, true, nil
+}
+
+func (h *Harness) settleGenerationOverflow(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation, generation Generation, message AgentMessage, reason string) (RunOutcome, error) {
+	message.Role = "assistant"
+	message.StopReason = StopReasonError
+	settings := current.State.Run.Settings.Compaction
+	prep, hasPreparation, err := h.buildCompactionPreparation(ctx, lane, current.LeafID, settings)
+	if err != nil {
+		return RunOutcome{}, err
+	}
+	responseID, usageID := generation.ResponseEntryID, generation.UsageID
+	entry := Entry{EntryBase: EntryBase{ID: responseID, ParentID: cloneStringPointer(current.LeafID), Type: EntryMessage}, Message: messageCopy(message)}
+	next := current.State
+	phase := RunPhase{Kind: PhaseFailureDrain, Error: &OperationError{Code: "overflow", Message: reason}, Provenance: &FailureProvenance{Kind: "response", EntryID: responseID}}
+	if hasPreparation && generation.Context.OverflowRecoveryUsed {
+		hasPreparation = false
+	}
+	if hasPreparation {
+		taskID := "task:overflow:" + responseID
+		phase = RunPhase{Kind: PhaseCompaction, Reason: "overflow", Structural: &StructuralDecision{TaskID: taskID, Status: "deciding"}, ResumeAfter: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationNeedAssistant, OverflowRecoveryUsed: true}, TriggerEntryID: generation.Context.TriggerEntryID}}
+	}
+	next.Run.Phase = phase
+	next.Run.LatestAssistantEntryID = &responseID
+	writes := []Write{{Kind: WriteEntry, Entry: &EntryWrite{Entry: entry}}, {Kind: WriteUsage, Usage: &UsageWrite{Row: UsageRow{ID: usageID, Usage: usageValue(message.Usage), EntryID: &responseID}}}, registerSet(RegisterLaneLeaf, lane.name, &responseID)}
+	if hasPreparation {
+		writes = append(writes, registerSet(RegisterOpPreparation, operation.OperationID+":"+phase.Structural.TaskID, prep))
+	}
+	writes = append(writes, registerSet(RegisterOpState, operation.OperationID, next))
+	var commit CommitResult
+	if err := h.effect(ctx, ActionInfo{Kind: "settlement", Description: "overflow response"}, func(ctx context.Context) error {
+		return h.line(lane.name).Do(ctx, func() error {
+			valid, err := (&runtimeEffects{harness: h, lane: lane}).current(ctx, current)
+			if err != nil || !valid {
+				if err == nil {
+					err = errOperationMissing
+				}
+				return err
+			}
+			commit, err = h.session.Commit(ctx, Transaction{Writes: writes})
+			return err
+		})
+	}); err != nil {
+		if isOperationMissing(err) {
+			return h.resolveExternalFinalization(ctx, lane, operation)
+		}
+		return RunOutcome{}, err
+	}
+	current.State = next
+	current.LeafID = &responseID
+	if len(commit.Seqs) != 0 {
+		current.OperationStateSeq = commit.Seqs[len(commit.Seqs)-1]
+	}
+	h.events.Emit(ctx, HarnessEvent{Type: string(EventEntryAdded), Lane: lane.name, Payload: cloneValue(entry)})
+	h.events.Emit(ctx, HarnessEvent{Type: string(EventUsage), Lane: lane.name, Payload: cloneValue(usageValue(message.Usage))})
+	if hasPreparation {
+		return h.drive(ctx, lane, operation, next)
+	}
+	return h.driveFailureDrain(ctx, lane, operation, current)
 }
 
 func (h *Harness) settleAborted(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation, generation Generation, message AgentMessage) (RunOutcome, error) {

@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -168,5 +169,135 @@ func TestHarnessReopensCompactionEffectPendingWithCapturedRetryPolicy(t *testing
 	entries, err := session.FindEntries(ctx, EntryQuery{Order: OldestFirst})
 	if err != nil || len(entries) != 3 || entries[2].Type != EntryCompaction {
 		t.Fatalf("recovered compaction entries = %v %+v", err, entries)
+	}
+}
+
+func newR9Harness(t *testing.T, models *retryModels) (*Harness, Session) {
+	t.Helper()
+	ctx := context.Background()
+	repo := NewMemorySessionRepo(SessionCodecOptions{})
+	session, err := repo.Create(ctx, SessionCreateOptions{ID: t.Name()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.View("main").AppendMessage(ctx, AgentMessage{Role: "user", Content: "old"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.View("main").AppendMessage(ctx, AgentMessage{Role: "assistant", Content: "answer", StopReason: StopReasonStop}); err != nil {
+		t.Fatal(err)
+	}
+	harness, suspended, err := NewHarness(ctx, AgentHarnessOptions{
+		Session: session,
+		Models:  models,
+		Model:   models.model,
+		Compaction: CompactionSettings{
+			Enabled:       true,
+			ReserveTokens: 1,
+		},
+	})
+	if err != nil || len(suspended) != 0 {
+		t.Fatalf("harness creation failed: %v %+v", err, suspended)
+	}
+	return harness, session
+}
+
+func TestHarnessThresholdCompactionRunsOnceBeforeAssistant(t *testing.T) {
+	models := &retryModels{
+		model: Model{Provider: "provider", ModelID: "model", ContextWindow: 5},
+		outcomes: []retryOutcome{
+			{message: AgentMessage{Role: "assistant", Content: "summary", StopReason: StopReasonStop}},
+			{message: AgentMessage{Role: "assistant", Content: "final", StopReason: StopReasonStop}},
+		},
+	}
+	harness, session := newR9Harness(t, models)
+	result, err := harness.Prompt(context.Background(), PromptInput{Text: "prompt"})
+	if err != nil || !result.OK || result.Value.Kind != "completed" {
+		t.Fatalf("threshold run = %v %+v", err, result)
+	}
+	if models.Calls() != 2 {
+		t.Fatalf("threshold provider calls = %d, want 2", models.Calls())
+	}
+	entries, err := session.FindEntries(context.Background(), EntryQuery{Order: OldestFirst})
+	if err != nil || len(entries) != 5 {
+		t.Fatalf("threshold entries = %v %+v", err, entries)
+	}
+	compactions := 0
+	for _, entry := range entries {
+		if entry.Type == EntryCompaction {
+			compactions++
+		}
+	}
+	if compactions != 1 || entries[3].Summary != "summary" || entries[4].Message == nil || entries[4].Message.Content != "final" {
+		t.Fatalf("threshold ledger = %+v", entries)
+	}
+	if len(models.requests) != 2 || len(models.requests[1]) != 2 || models.requests[1][0].Content != "summary" || models.requests[1][1].Content != "prompt" {
+		t.Fatalf("threshold resumed context = %+v", models.requests)
+	}
+}
+
+func TestOverflowClassifierLeavesToolPlanAsGenuineLength(t *testing.T) {
+	generation := Generation{IntendedOutputLimit: 10}
+	message := AgentMessage{Role: "assistant", StopReason: StopReasonLength, Usage: &Usage{Output: 1}, ToolCalls: []AgentToolCall{{ID: "call", Name: "echo"}}}
+	if overflow, _ := overflowMessage(message, generation); overflow {
+		t.Fatal("length response with tool calls was classified as overflow")
+	}
+	message.ToolCalls = nil
+	if overflow, _ := overflowMessage(message, generation); !overflow {
+		t.Fatal("truncated length response was not classified as overflow")
+	}
+}
+
+func TestHarnessOverflowCompactsAndContinues(t *testing.T) {
+	models := &retryModels{
+		model: Model{Provider: "provider", ModelID: "model"},
+		outcomes: []retryOutcome{
+			{err: fmt.Errorf("context window exceeded")},
+			{message: AgentMessage{Role: "assistant", Content: "recovered summary", StopReason: StopReasonStop}},
+			{message: AgentMessage{Role: "assistant", Content: "final", StopReason: StopReasonStop}},
+		},
+	}
+	harness, session := newR9Harness(t, models)
+	result, err := harness.Prompt(context.Background(), PromptInput{Text: "prompt"})
+	if err != nil || !result.OK || result.Value.Kind != "completed" {
+		t.Fatalf("overflow run = %v %+v", err, result)
+	}
+	if models.Calls() != 3 {
+		t.Fatalf("overflow provider calls = %d, want 3", models.Calls())
+	}
+	entries, err := session.FindEntries(context.Background(), EntryQuery{Order: OldestFirst})
+	if err != nil || len(entries) != 6 || entries[3].Message == nil || entries[3].Message.StopReason != StopReasonError || entries[4].Type != EntryCompaction || entries[5].Message == nil || entries[5].Message.Content != "final" {
+		t.Fatalf("overflow ledger = %v %+v", err, entries)
+	}
+}
+
+func TestHarnessSecondOverflowUsesBoundedFailure(t *testing.T) {
+	models := &retryModels{
+		model: Model{Provider: "provider", ModelID: "model"},
+		outcomes: []retryOutcome{
+			{err: fmt.Errorf("context length exceeded")},
+			{message: AgentMessage{Role: "assistant", Content: "recovered summary", StopReason: StopReasonStop}},
+			{err: fmt.Errorf("maximum context exceeded again")},
+		},
+	}
+	harness, session := newR9Harness(t, models)
+	result, err := harness.Prompt(context.Background(), PromptInput{Text: "prompt"})
+	if err != nil || !result.OK || result.Value.Kind != "failed" {
+		t.Fatalf("second overflow run = %v %+v", err, result)
+	}
+	if models.Calls() != 3 {
+		t.Fatalf("second overflow provider calls = %d, want 3", models.Calls())
+	}
+	entries, err := session.FindEntries(context.Background(), EntryQuery{Order: OldestFirst})
+	if err != nil || len(entries) != 6 {
+		t.Fatalf("second overflow entries = %v %+v", err, entries)
+	}
+	compactions := 0
+	for _, entry := range entries {
+		if entry.Type == EntryCompaction {
+			compactions++
+		}
+	}
+	if compactions != 1 || entries[len(entries)-1].Message == nil || entries[len(entries)-1].Message.StopReason != StopReasonError {
+		t.Fatalf("second overflow ledger = %+v", entries)
 	}
 }
