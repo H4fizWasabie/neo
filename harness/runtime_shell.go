@@ -60,6 +60,8 @@ type EffectPlan struct {
 	HookName         HookName
 	Event            JSONValue
 	StreamOptions    AgentHarnessStreamOptions
+	Model            Model
+	Messages         []Message
 }
 
 type EffectOutput struct {
@@ -958,6 +960,12 @@ type hookRegistration struct {
 
 func NewHookRunner() *HookRunner {
 	return &HookRunner{handlers: make(map[HookName][]hookRegistration)}
+}
+
+func (r *HookRunner) Has(name HookName) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.handlers[name]) != 0
 }
 
 func (r *HookRunner) On(name HookName, handler HookHandler, id string) (func(), error) {

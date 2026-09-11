@@ -17,6 +17,10 @@ type Harness struct {
 	settings           *SettingsSnapshot
 	tools              []AgentHarnessTool
 	resources          Resources
+	compaction         CompactionSettings
+	steeringMode       QueueMode
+	followUpMode       QueueMode
+	toolExecution      ToolExecutionMode
 	lines              sync.Map
 	scheduler          *ManualScheduler
 	hooks              *HookRunner
@@ -65,6 +69,10 @@ func NewHarness(ctx context.Context, options AgentHarnessOptions) (*Harness, []S
 		settings:           NewSettingsSnapshot(options.StreamOptions, NormalizedRetryPolicy{MaxAttempts: options.Retry.MaxRetries + 1, BaseDelayMs: options.Retry.BaseDelayMs}),
 		tools:              append([]AgentHarnessTool(nil), options.Tools...),
 		resources:          cloneValue(options.Resources).(Resources),
+		compaction:         options.Compaction,
+		steeringMode:       options.SteeringMode,
+		followUpMode:       options.FollowUpMode,
+		toolExecution:      options.ToolExecution,
 		scheduler:          NewManualScheduler(options.Drive == "manual"),
 		hooks:              NewHookRunner(),
 		events:             NewEventBus(),
@@ -131,6 +139,8 @@ func (h *Harness) line(name string) *LaneMutationLine {
 func (h *Harness) effect(ctx context.Context, info ActionInfo, fn func(context.Context) error) error {
 	effectCtx, cancel := context.WithCancel(h.rootCtx)
 	defer cancel()
+	stopCaller := context.AfterFunc(ctx, cancel)
+	defer stopCaller()
 	h.effects.Add(1)
 	run := fn
 	if h.telemetry != nil {
@@ -185,10 +195,22 @@ func (l *runtimeLane) GetLastResult(ctx context.Context) (*LaneLastResult, error
 func (l *runtimeLane) Prompt(ctx context.Context, input PromptInput) (Result[RunOutcome, error], error) {
 	messages := append([]AgentMessage(nil), input.Messages...)
 	if input.Text != "" {
-		messages = append(messages, AgentMessage{Role: "user", Content: input.Text})
+		content := JSONValue(input.Text)
+		if len(input.Images) != 0 {
+			content = map[string]JSONValue{"text": input.Text, "images": append([]ImageContent(nil), input.Images...)}
+		}
+		messages = append(messages, AgentMessage{Role: "user", Content: content})
+	} else if len(input.Images) != 0 {
+		messages = append(messages, AgentMessage{Role: "user", Content: append([]ImageContent(nil), input.Images...)})
 	}
 	if len(messages) == 0 {
-		return Err[RunOutcome](fmt.Errorf("prompt is empty")), nil
+		pending, err := l.hasPendingNextRun(ctx)
+		if err != nil {
+			return Result[RunOutcome, error]{Err: err}, nil
+		}
+		if !pending {
+			return Err[RunOutcome, error](&InvalidMessage{TaggedError: TaggedError{Message: "prompt is empty"}, Lane: l.name, Reason: "no messages"}), nil
+		}
 	}
 	callerMessages := append([]AgentMessage(nil), messages...)
 	if err := l.harness.lifecycle.Err(); err != nil {
@@ -202,37 +224,43 @@ func (l *runtimeLane) Prompt(ctx context.Context, input PromptInput) (Result[Run
 		return Result[RunOutcome, error]{Err: &MissingIdentities{TaggedError: TaggedError{Message: "active tool is unavailable"}, Lane: l.name, Tools: missing}}, nil
 	}
 	operationID := l.harness.session.IDGenerator().Next()
+	fx := &runtimeEffects{harness: l.harness, lane: l}
 	capturedSystemPrompt := ""
 	var resumeData map[string]JSONValue
-	if err := l.harness.effect(ctx, ActionInfo{Kind: "hook", Description: "before_run"}, func(ctx context.Context) error {
-		if l.harness.systemPrompt != nil {
-			var err error
-			capturedSystemPrompt, err = l.harness.systemPrompt(nil)
+	if l.harness.systemPrompt != nil {
+		var err error
+		capturedSystemPrompt, err = l.harness.systemPrompt(nil)
+		if err != nil {
+			return Result[RunOutcome, error]{Err: err}, nil
+		}
+	}
+	if l.harness.hooks.Has(HookBeforeRun) {
+		if err := l.harness.effect(ctx, ActionInfo{Kind: "hook", Description: "before_run"}, func(ctx context.Context) error {
+			output, err := fx.Run(ctx, EffectPlan{Kind: EffectHook, Key: EffectKey(operationID), HookName: HookBeforeRun, Event: map[string]JSONValue{"prompt": append([]AgentMessage(nil), messages...), "systemPrompt": capturedSystemPrompt, "resources": l.harness.resources}})
 			if err != nil {
 				return err
 			}
-		}
-		result, err := l.harness.hooks.Run(ctx, HookInvocation{Name: HookBeforeRun, Lane: l.name, RunID: operationID, Event: map[string]JSONValue{"prompt": append([]AgentMessage(nil), messages...), "systemPrompt": capturedSystemPrompt, "resources": l.harness.resources}})
-		if err != nil {
-			return err
-		}
-		if values, ok := result.(map[string]JSONValue); ok {
-			if injected, ok := values["messages"].([]AgentMessage); ok {
-				messages = append(messages, injected...)
+			result := output.Result
+			if values, ok := result.(map[string]JSONValue); ok {
+				if injected, ok := values["messages"].([]AgentMessage); ok {
+					messages = append(messages, injected...)
+				}
+				if override, ok := values["systemPrompt"].(string); ok {
+					capturedSystemPrompt = override
+				}
+				if data, ok := values["resumeData"].(map[string]JSONValue); ok {
+					resumeData = data
+				}
 			}
-			if override, ok := values["systemPrompt"].(string); ok {
-				capturedSystemPrompt = override
-			}
-			if data, ok := values["resumeData"].(map[string]JSONValue); ok {
-				resumeData = data
-			}
+			return nil
+		}); err != nil {
+			return Result[RunOutcome, error]{Err: err}, nil
 		}
-		return nil
-	}); err != nil {
-		return Result[RunOutcome, error]{Err: err}, nil
 	}
 	var accepted Operation
 	var acceptedState OperationState
+	l.begin()
+	acceptedInLine := false
 	if err := l.harness.line(l.name).Do(ctx, func() error {
 		laneStateRegister, err := l.harness.session.GetRegister(ctx, RegisterLaneState, l.name)
 		if err != nil {
@@ -303,17 +331,22 @@ func (l *runtimeLane) Prompt(ctx context.Context, input PromptInput) (Result[Run
 			return fmt.Errorf("prompt is empty")
 		}
 		accepted = Operation{OperationID: operationID, Lane: l.name, SourceLeafID: cloneStringPointer(leaf), StartedAt: time.Now().UnixMilli(), Intent: OperationIntent{Kind: OperationRun, PromptEntryIDs: promptIDs, SystemPromptOverride: capturedSystemPrompt, ResumeData: resumeData}}
-		acceptedState = OperationState{Kind: OperationRun, Run: &RunState{Kind: OperationRun, Control: Control{Status: ControlRunning}, Settings: RunSettings{ToolExecution: ToolExecutionParallel}, Phase: RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationNeedAssistant}, TriggerEntryID: *parent, SkipInboxOnce: true}}, Inbox: Inbox{}}}
+		acceptedState = OperationState{Kind: OperationRun, Run: &RunState{Kind: OperationRun, Control: Control{Status: ControlRunning}, Settings: RunSettings{Compaction: l.harness.compaction, SteeringMode: l.harness.steeringMode, FollowUpMode: l.harness.followUpMode, ToolExecution: l.harness.toolExecution}, Phase: RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationNeedAssistant}, TriggerEntryID: *parent, SkipInboxOnce: true}}, Inbox: Inbox{}}}
 		laneState.CurrentOperationID = &operationID
 		laneState.PendingNextRun = []string{}
 		writes = append(writes, registerSet(RegisterOpMeta, operationID, accepted), registerSet(RegisterOpState, operationID, acceptedState), registerSet(RegisterLaneLeaf, l.name, parent), registerSet(RegisterLaneState, l.name, laneState))
 		_, err = l.harness.session.Commit(ctx, Transaction{Writes: writes})
 		_ = config
+		acceptedInLine = err == nil
 		return err
 	}); err != nil {
+		l.finish()
 		return Result[RunOutcome, error]{Err: err}, nil
 	}
-	l.begin()
+	if !acceptedInLine {
+		l.finish()
+		return Result[RunOutcome, error]{Err: fmt.Errorf("prompt was not accepted")}, nil
+	}
 	l.harness.events.Emit(ctx, HarnessEvent{Type: string(EventRunStart), Lane: l.name, Payload: map[string]JSONValue{"runId": operationID}})
 	result, err := l.harness.drive(ctx, l, accepted, acceptedState)
 	if err != nil {
@@ -344,6 +377,18 @@ func mustActiveTools(ctx context.Context, l *runtimeLane) []string {
 		return nil
 	}
 	return config.ActiveToolNames
+}
+
+func (l *runtimeLane) hasPendingNextRun(ctx context.Context) (bool, error) {
+	register, err := l.harness.session.GetRegister(ctx, RegisterLaneState, l.name)
+	if err != nil || register == nil {
+		return false, err
+	}
+	state, ok := register.Value.(LaneState)
+	if !ok {
+		return false, fmt.Errorf("lane state has invalid type")
+	}
+	return len(state.PendingNextRun) != 0, nil
 }
 
 func missingActiveTools(tools []AgentHarnessTool, active []string) []string {
@@ -409,6 +454,7 @@ func applyStreamOptions(options AgentHarnessStreamOptions, patch AgentHarnessStr
 }
 
 func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operation, state OperationState) (RunOutcome, error) {
+	fx := &runtimeEffects{harness: h, lane: lane}
 	configRegister, err := h.session.GetRegister(ctx, RegisterLaneConfig, lane.name)
 	if err != nil {
 		return RunOutcome{}, err
@@ -417,13 +463,14 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 	settings := h.settings.Snapshot()
 	ready := state
 	ready.Run.Phase = RunPhase{Kind: PhaseAssistant, Generation: &Generation{Status: GenerationReady, NextAttempt: 1, Context: GenerationContext{StepID: operation.OperationID + ":step:1", TriggerEntryID: ready.Run.Phase.Checkpoint.TriggerEntryID, Configuration: config, StreamOptions: settings.StreamOptions, RetryPolicy: settings.RetryPolicy}}}
-	if err := h.commitState(ctx, lane, operation.OperationID, ready); err != nil {
+	if _, err := fx.CommitTransition(ctx, CurrentOperation{Operation: operation}, ready, h.telemetry, nil, nil); err != nil {
 		return RunOutcome{}, err
 	}
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventTurnStart), Lane: lane.name, Payload: map[string]JSONValue{"runId": operation.OperationID, "turnId": ready.Run.Phase.Generation.Context.StepID}})
 	requestOptions := settings.StreamOptions
 	if err := h.effect(ctx, ActionInfo{Kind: "hook", Description: "before_request"}, func(ctx context.Context) error {
-		result, err := h.hooks.Run(ctx, HookInvocation{Name: HookBeforeRequest, Lane: lane.name, RunID: operation.OperationID, Event: map[string]JSONValue{"step": "assistant", "attempt": int64(1), "streamOptions": requestOptions}})
+		output, err := fx.Run(ctx, EffectPlan{Kind: EffectHook, Key: EffectKey(operation.OperationID + ":before_request"), HookName: HookBeforeRequest, Event: map[string]JSONValue{"step": "assistant", "attempt": int64(1), "streamOptions": requestOptions}})
+		result := output.Result
 		if values, ok := result.(map[string]JSONValue); ok {
 			if patch, ok := values["streamOptions"].(AgentHarnessStreamOptionsPatch); ok {
 				requestOptions = applyStreamOptions(requestOptions, patch)
@@ -441,13 +488,19 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 	pending.Run.Phase.Generation.ResponseEntryID = responseID
 	pending.Run.Phase.Generation.UsageID = usageID
 	pending.Run.Phase.Generation.Context.StreamOptions = requestOptions
-	if err := h.commitState(ctx, lane, operation.OperationID, pending); err != nil {
+	if _, err := fx.CommitTransition(ctx, CurrentOperation{Operation: operation, State: ready}, pending, h.telemetry, nil, nil); err != nil {
 		return RunOutcome{}, err
 	}
 	message := AgentMessage{Role: "assistant"}
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventMessageStart), Lane: lane.name, Payload: cloneValue(message)})
+	payload := JSONValue("provider-request")
 	if err := h.effect(ctx, ActionInfo{Kind: "hook", Description: "before_payload"}, func(ctx context.Context) error {
-		_, err := h.hooks.Run(ctx, HookInvocation{Name: HookBeforePayload, Lane: lane.name, RunID: operation.OperationID, Event: map[string]JSONValue{"model": pending.Run.Phase.Generation.Context.Configuration.Model, "payload": "provider-request"}})
+		output, err := fx.Run(ctx, EffectPlan{Kind: EffectHook, Key: EffectKey(operation.OperationID + ":before_payload"), HookName: HookBeforePayload, Event: map[string]JSONValue{"model": pending.Run.Phase.Generation.Context.Configuration.Model, "payload": payload}})
+		if values, ok := output.Result.(map[string]JSONValue); ok {
+			if replacement, ok := values["payload"]; ok {
+				payload = replacement
+			}
+		}
 		return err
 	}); err != nil {
 		return h.failOperation(ctx, lane, operation, pending, err)
@@ -474,29 +527,24 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 				return err
 			}
 		}
-		model := pending.Run.Phase.Generation.Context.Configuration.Model
-		stream, err := h.models.Stream(ctx, model, providerMessages, pending.Run.Phase.Generation.Context.StreamOptions)
+		output, err := fx.Run(ctx, EffectPlan{Kind: EffectAssistant, Key: EffectKey(operation.OperationID + ":assistant"), Model: pending.Run.Phase.Generation.Context.Configuration.Model, Messages: providerMessages, StreamOptions: pending.Run.Phase.Generation.Context.StreamOptions})
 		if err != nil {
 			return err
 		}
-		for event := range stream {
-			if event.Message != nil {
-				message = *event.Message
-				h.events.Emit(ctx, HarnessEvent{Type: string(EventMessageUpdate), Lane: lane.name, Payload: cloneValue(message)})
-			}
+		if output.Message == nil {
+			return fmt.Errorf("provider returned no assistant message")
 		}
-		if message.Role == "" {
-			message = AgentMessage{Role: "assistant", Content: ""}
-		}
+		message = *output.Message
 		return nil
 	}); err != nil {
 		return h.failOperation(ctx, lane, operation, pending, err)
 	}
 	if err := h.effect(ctx, ActionInfo{Kind: "hook", Description: "after_response"}, func(ctx context.Context) error {
-		result, err := h.hooks.Run(ctx, HookInvocation{Name: HookAfterResponse, Lane: lane.name, RunID: operation.OperationID, Event: map[string]JSONValue{"message": message}})
+		output, err := fx.Run(ctx, EffectPlan{Kind: EffectHook, Key: EffectKey(operation.OperationID + ":after_response"), HookName: HookAfterResponse, Event: map[string]JSONValue{"message": message}})
 		if err != nil {
 			return err
 		}
+		result := output.Result
 		if patch, ok := result.(map[string]JSONValue); ok {
 			if replacement, ok := patch["message"].(AgentMessage); ok {
 				message = replacement
@@ -506,6 +554,12 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 	}); err != nil {
 		return h.failOperation(ctx, lane, operation, pending, err)
 	}
+	if message.StopReason == "" {
+		message.StopReason = StopReasonStop
+	}
+	if message.StopReason != StopReasonStop && message.StopReason != StopReasonLength {
+		return h.failOperation(ctx, lane, operation, pending, fmt.Errorf("unsupported assistant stop reason %q", message.StopReason))
+	}
 	if message.Role != "assistant" {
 		return h.failOperation(ctx, lane, operation, pending, fmt.Errorf("provider response has role %q", message.Role))
 	}
@@ -513,44 +567,21 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 		return h.failOperation(ctx, lane, operation, pending, fmt.Errorf("tool calls are not supported by the no-tool run"))
 	}
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventMessageEnd), Lane: lane.name, Payload: cloneValue(message)})
-	entry := Entry{EntryBase: EntryBase{ID: responseID, ParentID: stringPointer(pending.Run.Phase.Generation.Context.TriggerEntryID), Type: EntryMessage}, Message: messageCopy(message)}
 	usage := Usage{}
 	if message.Usage != nil {
 		usage = *message.Usage
 	}
-	if err := h.line(lane.name).Do(ctx, func() error {
-		_, err := h.session.Commit(ctx, Transaction{Writes: []Write{Write{Kind: WriteEntry, Entry: &EntryWrite{Entry: entry}}, Write{Kind: WriteUsage, Usage: &UsageWrite{Row: UsageRow{ID: usageID, Usage: usage, EntryID: &responseID}}}, registerSet(RegisterLaneLeaf, lane.name, stringPointer(responseID)), registerSet(RegisterOpState, operation.OperationID, OperationState{Kind: OperationRun, Run: &RunState{Kind: OperationRun, Control: Control{Status: ControlRunning}, Phase: RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationMayFinish}, TriggerEntryID: responseID}}, Inbox: Inbox{}, LatestAssistantEntryID: &responseID}})}})
-		return err
-	}); err != nil {
+	if _, err := fx.CommitEffectSettlement(ctx, CurrentOperation{Operation: operation, State: pending}, EffectPlan{Kind: EffectAssistant, Key: EffectKey(operation.OperationID), Generation: pending.Run.Phase.Generation}, SettlementOutput{Kind: "assistant", Key: EffectKey(operation.OperationID), Message: &message}, h.telemetry); err != nil {
 		return RunOutcome{}, err
 	}
+	entry := Entry{EntryBase: EntryBase{ID: responseID, ParentID: stringPointer(pending.Run.Phase.Generation.Context.TriggerEntryID), Type: EntryMessage}, Message: messageCopy(message)}
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventEntryAdded), Lane: lane.name, Payload: cloneValue(entry)})
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventUsage), Lane: lane.name, Payload: cloneValue(usage)})
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventTurnEnd), Lane: lane.name, Payload: map[string]JSONValue{"runId": operation.OperationID, "turnId": pending.Run.Phase.Generation.Context.StepID}})
-	if message.StopReason == "" {
-		message.StopReason = StopReasonStop
-	}
 	result := RunOutcome{Kind: "completed", RunID: operation.OperationID, LeafID: stringPointer(responseID), FinalEntryID: stringPointer(responseID), FinalMessage: &message}
-	laneStateRegister, err := h.session.GetRegister(ctx, RegisterLaneState, lane.name)
-	if err != nil {
+	if _, err := fx.CommitTerminal(ctx, CurrentOperation{Operation: operation, State: pending}, result); err != nil {
 		return RunOutcome{}, err
 	}
-	laneState := LaneState{PendingNextRun: []string{}}
-	if laneStateRegister != nil {
-		if current, ok := laneStateRegister.Value.(LaneState); ok {
-			laneState = current
-			laneState.CurrentOperationID = nil
-		}
-	}
-	cleanup, err := h.operationCleanupWrites(ctx, operation.OperationID, pending)
-	if err != nil {
-		return RunOutcome{}, err
-	}
-	terminalWrites := append(cleanup, registerSet(RegisterLaneLastResult, lane.name, LaneLastResult{OperationID: operation.OperationID, Kind: OperationRun, Outcome: result.Kind, LeafID: result.LeafID, FinalAssistantEntryID: result.FinalEntryID, RunCompletion: "assistant"}), registerSet(RegisterLaneState, lane.name, laneState))
-	if err := h.line(lane.name).Do(ctx, func() error { _, err := h.session.Commit(ctx, Transaction{Writes: terminalWrites}); return err }); err != nil {
-		return RunOutcome{}, err
-	}
-	lane.finish()
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventRunEnd), Lane: lane.name, Payload: cloneValue(result)})
 	return result, nil
 }
@@ -560,6 +591,137 @@ func (h *Harness) commitState(ctx context.Context, lane *runtimeLane, operationI
 		_, err := h.session.Commit(ctx, Transaction{Writes: []Write{registerSet(RegisterOpState, operationID, state)}})
 		return err
 	})
+}
+
+type runtimeEffects struct {
+	harness *Harness
+	lane    *runtimeLane
+}
+
+var _ Effects = (*runtimeEffects)(nil)
+
+func (e *runtimeEffects) CommitTransition(ctx context.Context, current CurrentOperation, next OperationState, _ TelemetryContext, _, _ *int64) (*CurrentOperation, error) {
+	if current.Operation.OperationID == "" {
+		return nil, fmt.Errorf("transition has no operation")
+	}
+	if err := e.harness.commitState(ctx, e.lane, current.Operation.OperationID, next); err != nil {
+		return nil, err
+	}
+	current.State = next
+	return &current, nil
+}
+
+func (e *runtimeEffects) CommitEffectSettlement(ctx context.Context, current CurrentOperation, plan EffectPlan, output SettlementOutput, _ TelemetryContext) (SettlementResult, error) {
+	if plan.Generation == nil || output.Message == nil {
+		return SettlementResult{}, fmt.Errorf("assistant settlement is incomplete")
+	}
+	responseID := plan.Generation.ResponseEntryID
+	usageID := plan.Generation.UsageID
+	if responseID == "" || usageID == "" {
+		return SettlementResult{}, fmt.Errorf("assistant settlement has no reserved ids")
+	}
+	message := *output.Message
+	usage := Usage{}
+	if message.Usage != nil {
+		usage = *message.Usage
+	}
+	entry := Entry{EntryBase: EntryBase{ID: responseID, ParentID: stringPointer(plan.Generation.Context.TriggerEntryID), Type: EntryMessage}, Message: messageCopy(message)}
+	next := OperationState{Kind: OperationRun, Run: &RunState{Kind: OperationRun, Control: Control{Status: ControlRunning}, Phase: RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationMayFinish}, TriggerEntryID: responseID}}, Inbox: Inbox{}, LatestAssistantEntryID: &responseID}}
+	if err := e.harness.line(e.lane.name).Do(ctx, func() error {
+		_, err := e.harness.session.Commit(ctx, Transaction{Writes: []Write{Write{Kind: WriteEntry, Entry: &EntryWrite{Entry: entry}}, Write{Kind: WriteUsage, Usage: &UsageWrite{Row: UsageRow{ID: usageID, Usage: usage, EntryID: &responseID}}}, registerSet(RegisterLaneLeaf, e.lane.name, stringPointer(responseID)), registerSet(RegisterOpState, current.Operation.OperationID, next)}})
+		return err
+	}); err != nil {
+		return SettlementResult{}, err
+	}
+	current.State = next
+	current.LeafID = stringPointer(responseID)
+	return SettlementResult{Current: current}, nil
+}
+
+func (e *runtimeEffects) CommitTerminal(ctx context.Context, current CurrentOperation, result OperationResult) (*CurrentOperation, error) {
+	run, ok := result.(RunOutcome)
+	if !ok {
+		return nil, fmt.Errorf("unsupported terminal result")
+	}
+	cleanup, err := e.harness.operationCleanupWrites(ctx, current.Operation.OperationID, current.State)
+	if err != nil {
+		return nil, err
+	}
+	laneState := LaneState{PendingNextRun: []string{}}
+	if register, err := e.harness.session.GetRegister(ctx, RegisterLaneState, e.lane.name); err != nil {
+		return nil, err
+	} else if register != nil {
+		if value, ok := register.Value.(LaneState); ok {
+			laneState = value
+			laneState.CurrentOperationID = nil
+		}
+	}
+	writes := append(cleanup, registerSet(RegisterLaneLastResult, e.lane.name, LaneLastResult{OperationID: current.Operation.OperationID, Kind: OperationRun, Outcome: run.Kind, LeafID: run.LeafID, FinalAssistantEntryID: run.FinalEntryID, RunCompletion: "assistant"}), registerSet(RegisterLaneState, e.lane.name, laneState))
+	if err := e.harness.line(e.lane.name).Do(ctx, func() error { _, err := e.harness.session.Commit(ctx, Transaction{Writes: writes}); return err }); err != nil {
+		return nil, err
+	}
+	e.lane.finish()
+	return nil, nil
+}
+
+func (e *runtimeEffects) FinalizeTool(context.Context, EffectPlan, EffectOutput) (SettlementOutput, error) {
+	return SettlementOutput{}, fmt.Errorf("tools are not implemented")
+}
+
+func (e *runtimeEffects) RunSummaryRequest(context.Context, SummaryRequestPlan) (SummaryRequestOutput, error) {
+	return SummaryRequestOutput{}, fmt.Errorf("summaries are not implemented")
+}
+
+func (e *runtimeEffects) SettleSummaryRequest(context.Context, CurrentOperation, SummaryRequestPlan, *AgentMessage, TelemetryContext) (CurrentOperation, error) {
+	return CurrentOperation{}, fmt.Errorf("summaries are not implemented")
+}
+
+func (e *runtimeEffects) Run(ctx context.Context, plan EffectPlan) (EffectOutput, error) {
+	switch plan.Kind {
+	case EffectHook:
+		result, err := e.harness.hooks.Run(ctx, HookInvocation{Name: plan.HookName, Lane: e.lane.name, RunID: string(plan.Key), Event: plan.Event})
+		return EffectOutput{Kind: "hook", Key: plan.Key, Result: result}, err
+	case EffectAssistant:
+		if _, err := e.harness.models.Resolve(ctx, plan.Model.Provider, plan.Model.ModelID); err != nil {
+			return EffectOutput{}, err
+		}
+		stream, err := e.harness.models.Stream(ctx, plan.Model, plan.Messages, plan.StreamOptions)
+		if err != nil {
+			return EffectOutput{}, err
+		}
+		if stream == nil {
+			return EffectOutput{}, fmt.Errorf("provider returned a nil stream")
+		}
+		var message *AgentMessage
+		for event := range stream {
+			if event.Message == nil {
+				continue
+			}
+			copy := *event.Message
+			message = &copy
+			e.harness.events.Emit(ctx, HarnessEvent{Type: string(EventMessageUpdate), Lane: e.lane.name, Payload: cloneValue(copy)})
+		}
+		if message == nil {
+			return EffectOutput{}, fmt.Errorf("provider returned no assistant message")
+		}
+		if message.Role == "" {
+			message.Role = "assistant"
+		}
+		return EffectOutput{Kind: "assistant", Key: plan.Key, Message: message}, nil
+	default:
+		return EffectOutput{}, fmt.Errorf("unsupported effect kind %q", plan.Kind)
+	}
+}
+
+func (e *runtimeEffects) Sleep(ctx context.Context, delayMs int64, _ TelemetryContext) error {
+	timer := time.NewTimer(time.Duration(delayMs) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (h *Harness) failOperation(ctx context.Context, lane *runtimeLane, operation Operation, state OperationState, cause error) (RunOutcome, error) {
@@ -603,7 +765,7 @@ func (h *Harness) failOperation(ctx context.Context, lane *runtimeLane, operatio
 			laneState.CurrentOperationID = nil
 		}
 	}
-	writes = append(writes, registerSet(RegisterLaneLastResult, lane.name, LaneLastResult{OperationID: operation.OperationID, Kind: OperationRun, Outcome: result.Kind, LeafID: result.LeafID, FinalAssistantEntryID: result.FinalEntryID, RunCompletion: "assistant", Error: errorValue}), registerSet(RegisterLaneState, lane.name, laneState))
+	writes = append(writes, registerSet(RegisterLaneLastResult, lane.name, LaneLastResult{OperationID: operation.OperationID, Kind: OperationRun, Outcome: result.Kind, LeafID: result.LeafID, FinalAssistantEntryID: result.FinalEntryID, Error: errorValue}), registerSet(RegisterLaneState, lane.name, laneState))
 	if err := h.line(lane.name).Do(ctx, func() error { _, err := h.session.Commit(ctx, Transaction{Writes: writes}); return err }); err != nil {
 		return RunOutcome{}, err
 	}
