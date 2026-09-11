@@ -120,7 +120,11 @@ func OpenJSONLStorage(path string, options JSONLStorageOptions) (*JSONLStorage, 
 	if header.Kind != "header" || header.V != jsonlVersion || header.ID == "" {
 		return nil, SessionMetadata{}, fmt.Errorf("invalid JSONL header")
 	}
-	if header.StorageVersion > CurrentStorageVersion {
+	storedVersion := header.StorageVersion
+	if storedVersion == 0 {
+		storedVersion = 1
+	}
+	if storedVersion > CurrentStorageVersion {
 		return nil, SessionMetadata{}, fmt.Errorf("session storage version %d is newer than binary version %d", header.StorageVersion, CurrentStorageVersion)
 	}
 	storage := &JSONLStorage{memory: NewMemoryStorage(MemoryStorageOptions{Codec: options.Codec, Now: options.Now}), path: path, header: header}
@@ -148,7 +152,15 @@ func OpenJSONLStorage(path string, options JSONLStorageOptions) (*JSONLStorage, 
 	if err != nil {
 		return nil, SessionMetadata{}, err
 	}
+	if storedVersion < CurrentStorageVersion {
+		storage.header.StorageVersion = CurrentStorageVersion
+		if err := storage.compactLocked(context.Background(), nil); err != nil {
+			return nil, SessionMetadata{}, err
+		}
+	}
 	metadata := SessionMetadata{ID: header.ID, CreatedAt: header.CreatedAt, StorageVersion: header.StorageVersion, StoreGeneration: header.StoreGeneration, CWD: header.CWD, ParentSessionID: header.ParentSessionID, LegacyParentSessionPath: header.LegacyParentSessionPath}
+	metadata.StorageVersion = storage.header.StorageVersion
+	metadata.StoreGeneration = storage.header.StoreGeneration
 	return storage, metadata, nil
 }
 
