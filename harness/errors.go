@@ -94,6 +94,22 @@ type RunOutcome struct {
 	Error        *OperationError `json:"error,omitempty"`
 }
 
+type MissingIdentitySuspension struct {
+	Reason        string   `json:"reason"`
+	MissingTools  []string `json:"missingTools,omitempty"`
+	MissingModels []string `json:"missingModels,omitempty"`
+}
+
+type RunResult = Result[RunOutcome, error]
+type CompactionResult = Result[CompactionOutcome, error]
+type NavigationResult = Result[NavigationOutcome, error]
+type ResumeResult = Result[ResumeOutcome, error]
+type QueueResult = Result[QueueOutcome, error]
+type NextRunResult = Result[NextRunOutcome, error]
+type CancelQueuedResult = Result[CancelQueuedOutcome, error]
+type AbortResult = Result[AbortOutcome, error]
+type RecordUsageResult = Result[RecordUsageOutcome, error]
+
 type CompactionOutcome struct {
 	Kind    string              `json:"kind"`
 	LeafID  *string             `json:"leafId,omitempty"`

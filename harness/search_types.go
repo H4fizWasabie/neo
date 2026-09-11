@@ -29,9 +29,12 @@ type EntrySearchHit struct {
 
 type SessionSearchService interface {
 	SearchSessions(context.Context, SearchQuery) ([]SessionSearchHit, error)
-	SearchEntries(context.Context, SearchQuery) ([]EntrySearchHit, error)
 	Sync(context.Context) error
 	Notify(string)
 	Remove(context.Context, string) error
 	Close(context.Context) error
+}
+
+type EntrySearchService interface {
+	SearchEntries(context.Context, SearchQuery) ([]EntrySearchHit, error)
 }

@@ -9,6 +9,40 @@ type HarnessEvent struct {
 	Payload  JSONValue `json:"payload,omitempty"`
 }
 
+type HarnessEventType string
+
+const (
+	EventRunStart        HarnessEventType = "run_start"
+	EventRunResume       HarnessEventType = "run_resume"
+	EventRunSuspend      HarnessEventType = "run_suspend"
+	EventRunAbort        HarnessEventType = "run_abort"
+	EventRunEnd          HarnessEventType = "run_end"
+	EventFault           HarnessEventType = "fault"
+	EventHandlerError    HarnessEventType = "handler_error"
+	EventTurnStart       HarnessEventType = "turn_start"
+	EventTurnEnd         HarnessEventType = "turn_end"
+	EventRetryScheduled  HarnessEventType = "retry_scheduled"
+	EventRetryStart      HarnessEventType = "retry_start"
+	EventRetryEnd        HarnessEventType = "retry_end"
+	EventMessageStart    HarnessEventType = "message_start"
+	EventMessageUpdate   HarnessEventType = "message_update"
+	EventMessageEnd      HarnessEventType = "message_end"
+	EventToolStart       HarnessEventType = "tool_start"
+	EventToolUpdate      HarnessEventType = "tool_update"
+	EventToolEnd         HarnessEventType = "tool_end"
+	EventEntryAdded      HarnessEventType = "entry_added"
+	EventWritePending    HarnessEventType = "write_pending"
+	EventQueueUpdate     HarnessEventType = "queue_update"
+	EventFactUpdate      HarnessEventType = "fact_update"
+	EventConfigUpdate    HarnessEventType = "config_update"
+	EventCompactionStart HarnessEventType = "compaction_start"
+	EventCompactionEnd   HarnessEventType = "compaction_end"
+	EventNavigationStart HarnessEventType = "navigation_start"
+	EventNavigationEnd   HarnessEventType = "navigation_end"
+	EventLaneCreated     HarnessEventType = "lane_created"
+	EventUsage           HarnessEventType = "usage"
+)
+
 type Events interface {
 	On(eventType string, listener func(context.Context, HarnessEvent)) (unsubscribe func())
 }

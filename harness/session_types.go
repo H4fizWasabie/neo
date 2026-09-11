@@ -61,6 +61,8 @@ type SessionTree interface {
 	SetName(context.Context, *string) error
 	GetLabel(context.Context, string) (*string, error)
 	SetLabel(context.Context, string, *string) error
+	GetCustomFact(context.Context, string) (JSONValue, error)
+	SetCustomFact(context.Context, string, JSONValue) error
 	FindEntries(context.Context, EntryQuery) ([]Entry, error)
 	FindEntry(context.Context, EntryQuery) (*Entry, error)
 	FindEntriesOnBranch(context.Context, BranchScan) ([]Entry, error)
