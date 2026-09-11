@@ -93,14 +93,14 @@ func openSQLiteStorage(path string, metadata SessionMetadata, options SQLiteStor
 		if metadata.StorageVersion == 0 {
 			metadata.StorageVersion = CurrentStorageVersion
 		}
-		if _, err := db.Exec(`INSERT INTO session (id, created_at, storage_version, cwd, parent_session_id, next_seq, message_count, cached_tokens, uncached_tokens, total_tokens, cost_total) VALUES (?, ?, ?, ?, ?, 1, 0, 0, 0, 0, 0)`, metadata.ID, metadata.CreatedAt, metadata.StorageVersion, metadata.CWD, nullString(metadata.ParentSessionID)); err != nil {
+		if _, err := db.Exec(`INSERT INTO session (id, created_at, storage_version, store_generation, cwd, parent_session_id, next_seq, message_count, cached_tokens, uncached_tokens, total_tokens, cost_total) VALUES (?, ?, ?, ?, ?, ?, 1, 0, 0, 0, 0, 0)`, metadata.ID, metadata.CreatedAt, metadata.StorageVersion, metadata.StoreGeneration, metadata.CWD, nullString(metadata.ParentSessionID)); err != nil {
 			db.Close()
 			return nil, SessionMetadata{}, err
 		}
 	} else {
-		row := db.QueryRow(`SELECT id, created_at, storage_version, cwd, parent_session_id FROM session LIMIT 1`)
+		row := db.QueryRow(`SELECT id, created_at, storage_version, store_generation, cwd, parent_session_id FROM session LIMIT 1`)
 		var parent sql.NullString
-		if err := row.Scan(&metadata.ID, &metadata.CreatedAt, &metadata.StorageVersion, &metadata.CWD, &parent); err != nil {
+		if err := row.Scan(&metadata.ID, &metadata.CreatedAt, &metadata.StorageVersion, &metadata.StoreGeneration, &metadata.CWD, &parent); err != nil {
 			db.Close()
 			return nil, SessionMetadata{}, err
 		}
@@ -138,7 +138,7 @@ func openSQLiteStorage(path string, metadata SessionMetadata, options SQLiteStor
 }
 
 const sqliteSchema = `
-CREATE TABLE IF NOT EXISTS session (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, storage_version INTEGER NOT NULL, cwd TEXT NOT NULL DEFAULT '', parent_session_id TEXT, next_seq INTEGER NOT NULL, message_count INTEGER NOT NULL, cached_tokens INTEGER NOT NULL, uncached_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL, cost_total REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS session (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, storage_version INTEGER NOT NULL, store_generation INTEGER NOT NULL DEFAULT 0, cwd TEXT NOT NULL DEFAULT '', parent_session_id TEXT, next_seq INTEGER NOT NULL, message_count INTEGER NOT NULL, cached_tokens INTEGER NOT NULL, uncached_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL, cost_total REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS entries (id TEXT PRIMARY KEY, seq INTEGER NOT NULL UNIQUE, parent_id TEXT, type TEXT NOT NULL, custom_type TEXT, timestamp INTEGER NOT NULL, payload TEXT NOT NULL) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS ix_entries_parent ON entries(parent_id);
 CREATE INDEX IF NOT EXISTS ix_entries_seq ON entries(seq, type);
@@ -1014,7 +1014,7 @@ func readSQLiteMetadata(ctx context.Context, path string) (SessionMetadata, erro
 	defer db.Close()
 	var metadata SessionMetadata
 	var parent sql.NullString
-	err = db.QueryRowContext(ctx, `SELECT id, created_at, storage_version, cwd, parent_session_id FROM session LIMIT 1`).Scan(&metadata.ID, &metadata.CreatedAt, &metadata.StorageVersion, &metadata.CWD, &parent)
+	err = db.QueryRowContext(ctx, `SELECT id, created_at, storage_version, store_generation, cwd, parent_session_id FROM session LIMIT 1`).Scan(&metadata.ID, &metadata.CreatedAt, &metadata.StorageVersion, &metadata.StoreGeneration, &metadata.CWD, &parent)
 	if err != nil {
 		return SessionMetadata{}, err
 	}
@@ -1271,6 +1271,7 @@ func (r *SQLiteSessionRepo) Rewrite(ctx context.Context, source SessionMetadata,
 		return nil, err
 	}
 	defer os.Remove(temporaryPath)
+	stored.StoreGeneration++
 	rewritten, err := CreateSQLiteStorage(temporaryPath, stored, r.options)
 	if err != nil {
 		return nil, err

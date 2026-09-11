@@ -26,6 +26,7 @@ type jsonlHeader struct {
 	Kind                    string `json:"kind"`
 	ID                      string `json:"id"`
 	StorageVersion          int    `json:"storageVersion"`
+	StoreGeneration         int64  `json:"storeGeneration"`
 	CreatedAt               int64  `json:"createdAt"`
 	CWD                     string `json:"cwd,omitempty"`
 	ParentSessionID         string `json:"parentSessionId,omitempty"`
@@ -79,7 +80,7 @@ func CreateJSONLStorage(path string, metadata SessionMetadata, options JSONLStor
 	if err != nil {
 		return nil, err
 	}
-	storage := &JSONLStorage{memory: NewMemoryStorage(MemoryStorageOptions{Codec: options.Codec, Now: options.Now}), path: path, file: file, header: jsonlHeader{V: jsonlVersion, Kind: "header", ID: metadata.ID, StorageVersion: metadata.StorageVersion, CreatedAt: metadata.CreatedAt, CWD: metadata.CWD, ParentSessionID: metadata.ParentSessionID, LegacyParentSessionPath: metadata.LegacyParentSessionPath}}
+	storage := &JSONLStorage{memory: NewMemoryStorage(MemoryStorageOptions{Codec: options.Codec, Now: options.Now}), path: path, file: file, header: jsonlHeader{V: jsonlVersion, Kind: "header", ID: metadata.ID, StorageVersion: metadata.StorageVersion, StoreGeneration: metadata.StoreGeneration, CreatedAt: metadata.CreatedAt, CWD: metadata.CWD, ParentSessionID: metadata.ParentSessionID, LegacyParentSessionPath: metadata.LegacyParentSessionPath}}
 	if err := storage.writeHeader(); err != nil {
 		file.Close()
 		return nil, err
@@ -147,7 +148,7 @@ func OpenJSONLStorage(path string, options JSONLStorageOptions) (*JSONLStorage, 
 	if err != nil {
 		return nil, SessionMetadata{}, err
 	}
-	metadata := SessionMetadata{ID: header.ID, CreatedAt: header.CreatedAt, StorageVersion: header.StorageVersion, CWD: header.CWD, ParentSessionID: header.ParentSessionID, LegacyParentSessionPath: header.LegacyParentSessionPath}
+	metadata := SessionMetadata{ID: header.ID, CreatedAt: header.CreatedAt, StorageVersion: header.StorageVersion, StoreGeneration: header.StoreGeneration, CWD: header.CWD, ParentSessionID: header.ParentSessionID, LegacyParentSessionPath: header.LegacyParentSessionPath}
 	return storage, metadata, nil
 }
 
