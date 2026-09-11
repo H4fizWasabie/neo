@@ -285,6 +285,8 @@ func (s *JSONLStorage) compactLocked(ctx context.Context, keep func(kind, id str
 		records = append(records, recordForRegister(register))
 	}
 	sort.SliceStable(records, func(i, j int) bool { return records[i].Seq < records[j].Seq })
+	headerValue := s.header
+	headerValue.StoreGeneration++
 	temporary, err := os.CreateTemp(filepath.Dir(s.path), ".neo-jsonl-compact-*")
 	if err != nil {
 		return err
@@ -292,7 +294,7 @@ func (s *JSONLStorage) compactLocked(ctx context.Context, keep func(kind, id str
 	temporaryName := temporary.Name()
 	defer os.Remove(temporaryName)
 	writer := bufio.NewWriter(temporary)
-	header, err := json.Marshal(s.header)
+	header, err := json.Marshal(headerValue)
 	if err == nil {
 		_, err = writer.Write(append(header, '\n'))
 	}
@@ -322,6 +324,7 @@ func (s *JSONLStorage) compactLocked(ctx context.Context, keep func(kind, id str
 	if err := os.Rename(temporaryName, s.path); err != nil {
 		return err
 	}
+	s.header = headerValue
 	s.file, err = os.OpenFile(s.path, os.O_RDWR|os.O_APPEND, 0o600)
 	return err
 }

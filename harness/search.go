@@ -158,7 +158,7 @@ func (s *SQLiteSearchService) syncSessionLocked(ctx context.Context, metadata Se
 		}
 		generation, lastSeq = metadata.StoreGeneration, 0
 	}
-	session, err := s.repo.Open(ctx, metadata)
+	session, err := s.openSearchSession(ctx, metadata)
 	if err != nil {
 		return err
 	}
@@ -213,7 +213,7 @@ func (s *SQLiteSearchService) syncSessionLocked(ctx context.Context, metadata Se
 			}
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO search_cursors(session_id, store_generation, last_seq) VALUES (?, ?, ?) ON CONFLICT(session_id, store_generation) DO UPDATE SET last_seq = excluded.last_seq`, metadata.ID, generation, nextSeq); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO search_cursors(session_id, store_generation, last_seq) VALUES (?, ?, ?) ON CONFLICT(session_id, store_generation) DO UPDATE SET last_seq = MAX(search_cursors.last_seq, excluded.last_seq)`, metadata.ID, generation, nextSeq); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -287,6 +287,7 @@ func (s *SQLiteSearchService) searchRows(ctx context.Context, query SearchQuery,
 SELECT d.session_id, d.entry_id, d.timestamp, bm25(search_fts) AS score,
 snippet(search_fts, 0, '[', ']', '...', 12) AS snippet
 FROM search_fts JOIN search_documents d ON d.rowid = search_fts.rowid
+JOIN search_cursors c ON c.session_id = d.session_id AND c.store_generation = d.store_generation AND c.store_generation = (SELECT MAX(c2.store_generation) FROM search_cursors c2 WHERE c2.session_id = d.session_id)
 WHERE search_fts MATCH ?
 )
 SELECT session_id, entry_id, timestamp, snippet, score FROM matches %s ORDER BY score, timestamp DESC LIMIT ?`, group)
@@ -294,6 +295,7 @@ SELECT session_id, entry_id, timestamp, snippet, score FROM matches %s ORDER BY 
 		querySQL = fmt.Sprintf(`WITH matches AS (
 SELECT session_id, entry_id, timestamp, 0.0 AS score, text AS snippet
 FROM search_documents WHERE text LIKE ?
+AND store_generation = (SELECT MAX(c.store_generation) FROM search_cursors c WHERE c.session_id = search_documents.session_id)
 )
 SELECT session_id, entry_id, timestamp, snippet, score FROM matches %s ORDER BY timestamp DESC LIMIT ?`, group)
 		match = "%" + strings.TrimSpace(query.Text) + "%"
@@ -354,6 +356,17 @@ func (s *SQLiteSearchService) syncSession(sessionID string) error {
 		}
 	}
 	return s.removeLocked(context.Background(), sessionID)
+}
+
+func (s *SQLiteSearchService) openSearchSession(ctx context.Context, metadata SessionMetadata) (Session, error) {
+	if repo, ok := s.repo.(*SQLiteSessionRepo); ok {
+		storage, stored, err := openSQLiteSnapshot(repo.path(metadata.ID), repo.options)
+		if err != nil {
+			return nil, err
+		}
+		return newSession(stored, storage), nil
+	}
+	return s.repo.Open(ctx, metadata)
 }
 
 func (s *SQLiteSearchService) Remove(ctx context.Context, sessionID string) error {

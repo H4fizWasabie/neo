@@ -87,3 +87,43 @@ func TestSQLiteSearchNotifyCatchesUpWithoutACommitDependency(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSQLiteSearchResetsAfterStoreRewrite(t *testing.T) {
+	ctx := context.Background()
+	repo := NewSQLiteSessionRepo(t.TempDir(), SQLiteStorageOptions{OwnerID: "writer"})
+	session, err := repo.Create(ctx, SessionCreateOptions{ID: "session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.AppendMessage(ctx, AgentMessage{Role: "user", Content: "rewrite target"}); err != nil {
+		t.Fatal(err)
+	}
+	metadata := session.Metadata()
+	if err := session.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	search, err := NewSQLiteSearchService(SQLiteSearchOptions{Repo: repo, Path: filepath.Join(t.TempDir(), "search.sqlite")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := search.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rewritten, err := repo.Rewrite(ctx, metadata, func(string, string) bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rewritten.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := search.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := search.SearchEntries(ctx, SearchQuery{Text: "rewrite"})
+	if err != nil || len(hits) != 1 {
+		t.Fatalf("generation-aware reindex failed: %v %+v", err, hits)
+	}
+	if err := search.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
