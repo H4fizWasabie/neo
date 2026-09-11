@@ -1,0 +1,14 @@
+node_modules/
+dist/
+coverage/
+.codegraph/
+
+# Go build output
+/neo
+*.test
+
+# Local/editor files
+.DS_Store
+.env
+.env.*
+!.env.example
