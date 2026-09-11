@@ -73,6 +73,7 @@ type EffectOutput struct {
 	Kind       string
 	Key        EffectKey
 	Message    *AgentMessage
+	Deferred   *DeferredResponse
 	Summary    *SummaryAttemptOutcome
 	ToolResult *AgentToolResult
 	IsError    bool

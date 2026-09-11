@@ -115,8 +115,9 @@ func (m *retryModels) Stream(_ context.Context, _ Model, _ []Message, _ AgentHar
 	return stream, nil
 }
 
-func (*retryModels) FetchDeferred(context.Context, Model, DeferredHandle, AgentHarnessStreamOptions) (DeferredResponse, error) {
-	return DeferredResponse{}, nil
+func (*retryModels) FetchDeferred(_ context.Context, _ Model, handle DeferredHandle, _ AgentHarnessStreamOptions) (DeferredResponse, error) {
+	message := AgentMessage{Role: "assistant", Content: handle, StopReason: StopReasonDeferred}
+	return DeferredResponse{Kind: "pending", Handle: &handle, Message: &message}, nil
 }
 
 func (m *retryModels) CancelDeferred(context.Context, Model, DeferredHandle) error {
