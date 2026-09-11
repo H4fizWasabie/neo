@@ -8,6 +8,70 @@ type TaggedError struct {
 
 func (e *TaggedError) Error() string { return e.Message }
 
+type LaneBusy struct {
+	TaggedError
+	Lane          string
+	OperationID   string
+	OperationKind OperationKind
+}
+
+type MissingIdentities struct {
+	TaggedError
+	Lane   string
+	Tools  []string
+	Models []string
+}
+
+type NoActiveRun struct {
+	TaggedError
+	Lane string
+}
+type NoActiveOperation struct {
+	TaggedError
+	Lane string
+}
+type NothingToResume struct {
+	TaggedError
+	Lane string
+}
+type NothingToCompact struct {
+	TaggedError
+	Lane string
+}
+type InvalidMessage struct {
+	TaggedError
+	Lane, Reason string
+}
+type InvalidNavigation struct {
+	TaggedError
+	Lane, Reason string
+}
+type UnknownSkill struct {
+	TaggedError
+	Name string
+}
+type UnknownTemplate struct {
+	TaggedError
+	Name string
+}
+type UnknownTarget struct {
+	TaggedError
+	TargetID string
+}
+type UnknownQueueItem struct {
+	TaggedError
+	EntryID string
+}
+type LaneExists struct {
+	TaggedError
+	Lane string
+}
+type InvalidLane struct {
+	TaggedError
+	Lane, Reason string
+}
+type Closed struct{ TaggedError }
+
 type HarnessFault struct {
 	Message string
 	Cause   error
