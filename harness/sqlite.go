@@ -22,18 +22,20 @@ type SQLiteStorageOptions struct {
 }
 
 type SQLiteStorage struct {
-	db      *sql.DB
-	path    string
-	session SessionMetadata
-	memory  *MemoryStorage
-	codec   SessionCodec
-	now     func() time.Time
-	ownerID string
-	lease   int64
-	ttl     time.Duration
-	leased  bool
-	mu      sync.Mutex
-	closed  bool
+	db        *sql.DB
+	path      string
+	session   SessionMetadata
+	memory    *MemoryStorage
+	codec     SessionCodec
+	now       func() time.Time
+	ownerID   string
+	lease     int64
+	ttl       time.Duration
+	leased    bool
+	leaseStop chan struct{}
+	leaseDone chan struct{}
+	mu        sync.Mutex
+	closed    bool
 }
 
 func CreateSQLiteStorage(path string, metadata SessionMetadata, options SQLiteStorageOptions) (*SQLiteStorage, error) {
@@ -117,6 +119,9 @@ func openSQLiteStorage(path string, metadata SessionMetadata, options SQLiteStor
 			db.Close()
 			return nil, SessionMetadata{}, err
 		}
+		storage.leaseStop = make(chan struct{})
+		storage.leaseDone = make(chan struct{})
+		go storage.renewLeaseLoop()
 	}
 	if !create {
 		if err := storage.loadShadow(); err != nil {
@@ -179,6 +184,63 @@ func (s *SQLiteStorage) acquireLease() error {
 		return err
 	}
 	s.lease = fence
+	return nil
+}
+
+func (s *SQLiteStorage) renewLeaseLoop() {
+	defer close(s.leaseDone)
+	interval := s.ttl / 3
+	if interval < 10*time.Millisecond {
+		interval = 10 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			_ = s.renewLease()
+		case <-s.leaseStop:
+			return
+		}
+	}
+}
+
+func (s *SQLiteStorage) renewLease() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || !s.leased {
+		return nil
+	}
+	conn, err := s.db.Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+	now := s.now().UnixMilli()
+	result, err := conn.ExecContext(context.Background(), `UPDATE writer_lease SET expires_at_ms = ? WHERE owner_id = ? AND fence = ? AND expires_at_ms > ?`, now+s.ttl.Milliseconds(), s.ownerID, s.lease, now)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return fmt.Errorf("session writer lease was lost")
+	}
+	if _, err := conn.ExecContext(context.Background(), "COMMIT"); err != nil {
+		return err
+	}
+	committed = true
 	return nil
 }
 
@@ -733,11 +795,19 @@ func filterBranchEntries(entries []Entry, query BranchScan) []Entry {
 
 func (s *SQLiteStorage) Close(ctx context.Context) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return nil
 	}
 	s.closed = true
+	stop, done := s.leaseStop, s.leaseDone
+	s.mu.Unlock()
+	if stop != nil {
+		close(stop)
+		<-done
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.leased {
 		return s.db.Close()
 	}
