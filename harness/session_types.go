@@ -12,6 +12,7 @@ type SessionMetadata struct {
 	ID                      string `json:"id"`
 	CreatedAt               int64  `json:"createdAt"`
 	StorageVersion          int    `json:"storageVersion"`
+	StoreGeneration         int64  `json:"storeGeneration"`
 	CWD                     string `json:"cwd,omitempty"`
 	ParentSessionID         string `json:"parentSessionId,omitempty"`
 	LegacyParentSessionPath string `json:"legacyParentSessionPath,omitempty"`
