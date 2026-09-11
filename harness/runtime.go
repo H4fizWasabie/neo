@@ -59,7 +59,7 @@ func NewHarness(ctx context.Context, options AgentHarnessOptions) (*Harness, []S
 	if options.Retry.MaxRetries < 0 {
 		return nil, nil, fmt.Errorf("retry max cannot be negative")
 	}
-	rootCtx, cancel := context.WithCancel(ctx)
+	rootCtx, cancel := context.WithCancel(context.Background())
 	h := &Harness{
 		session:            options.Session,
 		models:             options.Models,
@@ -259,8 +259,8 @@ func (l *runtimeLane) Prompt(ctx context.Context, input PromptInput) (Result[Run
 	}
 	var accepted Operation
 	var acceptedState OperationState
-	l.begin()
 	acceptedInLine := false
+	begun := false
 	if err := l.harness.line(l.name).Do(ctx, func() error {
 		laneStateRegister, err := l.harness.session.GetRegister(ctx, RegisterLaneState, l.name)
 		if err != nil {
@@ -273,6 +273,8 @@ func (l *runtimeLane) Prompt(ctx context.Context, input PromptInput) (Result[Run
 		if !ok || laneState.CurrentOperationID != nil {
 			return &LaneBusy{TaggedError: TaggedError{Message: "lane is busy"}, Lane: l.name}
 		}
+		l.begin()
+		begun = true
 		leafRegister, err := l.harness.session.GetRegister(ctx, RegisterLaneLeaf, l.name)
 		if err != nil {
 			return err
@@ -340,7 +342,9 @@ func (l *runtimeLane) Prompt(ctx context.Context, input PromptInput) (Result[Run
 		acceptedInLine = err == nil
 		return err
 	}); err != nil {
-		l.finish()
+		if begun {
+			l.finish()
+		}
 		return Result[RunOutcome, error]{Err: err}, nil
 	}
 	if !acceptedInLine {
@@ -455,6 +459,14 @@ func applyStreamOptions(options AgentHarnessStreamOptions, patch AgentHarnessStr
 
 func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operation, state OperationState) (RunOutcome, error) {
 	fx := &runtimeEffects{harness: h, lane: lane}
+	restored, err := Restore(ctx, h.session, lane.name)
+	if err != nil || restored.Current == nil {
+		if err != nil {
+			return RunOutcome{}, err
+		}
+		return RunOutcome{}, fmt.Errorf("operation disappeared before drive")
+	}
+	current := *restored.Current
 	configRegister, err := h.session.GetRegister(ctx, RegisterLaneConfig, lane.name)
 	if err != nil {
 		return RunOutcome{}, err
@@ -463,9 +475,20 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 	settings := h.settings.Snapshot()
 	ready := state
 	ready.Run.Phase = RunPhase{Kind: PhaseAssistant, Generation: &Generation{Status: GenerationReady, NextAttempt: 1, Context: GenerationContext{StepID: operation.OperationID + ":step:1", TriggerEntryID: ready.Run.Phase.Checkpoint.TriggerEntryID, Configuration: config, StreamOptions: settings.StreamOptions, RetryPolicy: settings.RetryPolicy}}}
-	if _, err := fx.CommitTransition(ctx, CurrentOperation{Operation: operation}, ready, h.telemetry, nil, nil); err != nil {
+	configurationSeq := current.ConfigurationSeq
+	settingsRevision := settings.SettingsRevision
+	var transition *CurrentOperation
+	if err := h.effect(ctx, ActionInfo{Kind: "transition", Description: "assistant ready"}, func(ctx context.Context) error {
+		var err error
+		transition, err = fx.CommitTransition(ctx, current, ready, h.telemetry, &configurationSeq, &settingsRevision)
+		return err
+	}); err != nil {
 		return RunOutcome{}, err
 	}
+	if transition == nil {
+		return RunOutcome{}, fmt.Errorf("assistant transition lost its compare-and-swap")
+	}
+	current = *transition
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventTurnStart), Lane: lane.name, Payload: map[string]JSONValue{"runId": operation.OperationID, "turnId": ready.Run.Phase.Generation.Context.StepID}})
 	requestOptions := settings.StreamOptions
 	if err := h.effect(ctx, ActionInfo{Kind: "hook", Description: "before_request"}, func(ctx context.Context) error {
@@ -488,9 +511,17 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 	pending.Run.Phase.Generation.ResponseEntryID = responseID
 	pending.Run.Phase.Generation.UsageID = usageID
 	pending.Run.Phase.Generation.Context.StreamOptions = requestOptions
-	if _, err := fx.CommitTransition(ctx, CurrentOperation{Operation: operation, State: ready}, pending, h.telemetry, nil, nil); err != nil {
+	if err := h.effect(ctx, ActionInfo{Kind: "transition", Description: "assistant effect pending"}, func(ctx context.Context) error {
+		var err error
+		transition, err = fx.CommitTransition(ctx, current, pending, h.telemetry, nil, nil)
+		return err
+	}); err != nil {
 		return RunOutcome{}, err
 	}
+	if transition == nil {
+		return RunOutcome{}, fmt.Errorf("assistant intent lost its compare-and-swap")
+	}
+	current = *transition
 	message := AgentMessage{Role: "assistant"}
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventMessageStart), Lane: lane.name, Payload: cloneValue(message)})
 	payload := JSONValue("provider-request")
@@ -571,15 +602,24 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 	if message.Usage != nil {
 		usage = *message.Usage
 	}
-	if _, err := fx.CommitEffectSettlement(ctx, CurrentOperation{Operation: operation, State: pending}, EffectPlan{Kind: EffectAssistant, Key: EffectKey(operation.OperationID), Generation: pending.Run.Phase.Generation}, SettlementOutput{Kind: "assistant", Key: EffectKey(operation.OperationID), Message: &message}, h.telemetry); err != nil {
+	var settled SettlementResult
+	if err := h.effect(ctx, ActionInfo{Kind: "settlement", Description: "assistant response"}, func(ctx context.Context) error {
+		var err error
+		settled, err = fx.CommitEffectSettlement(ctx, current, EffectPlan{Kind: EffectAssistant, Key: EffectKey(operation.OperationID), Generation: pending.Run.Phase.Generation}, SettlementOutput{Kind: "assistant", Key: EffectKey(operation.OperationID), Message: &message}, h.telemetry)
+		return err
+	}); err != nil {
 		return RunOutcome{}, err
 	}
+	current = settled.Current
 	entry := Entry{EntryBase: EntryBase{ID: responseID, ParentID: stringPointer(pending.Run.Phase.Generation.Context.TriggerEntryID), Type: EntryMessage}, Message: messageCopy(message)}
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventEntryAdded), Lane: lane.name, Payload: cloneValue(entry)})
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventUsage), Lane: lane.name, Payload: cloneValue(usage)})
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventTurnEnd), Lane: lane.name, Payload: map[string]JSONValue{"runId": operation.OperationID, "turnId": pending.Run.Phase.Generation.Context.StepID}})
 	result := RunOutcome{Kind: "completed", RunID: operation.OperationID, LeafID: stringPointer(responseID), FinalEntryID: stringPointer(responseID), FinalMessage: &message}
-	if _, err := fx.CommitTerminal(ctx, CurrentOperation{Operation: operation, State: pending}, result); err != nil {
+	if err := h.effect(ctx, ActionInfo{Kind: "terminal", Description: "assistant terminal"}, func(ctx context.Context) error {
+		_, err := fx.CommitTerminal(ctx, current, result)
+		return err
+	}); err != nil {
 		return RunOutcome{}, err
 	}
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventRunEnd), Lane: lane.name, Payload: cloneValue(result)})
@@ -600,14 +640,42 @@ type runtimeEffects struct {
 
 var _ Effects = (*runtimeEffects)(nil)
 
-func (e *runtimeEffects) CommitTransition(ctx context.Context, current CurrentOperation, next OperationState, _ TelemetryContext, _, _ *int64) (*CurrentOperation, error) {
+func (e *runtimeEffects) current(ctx context.Context, expected CurrentOperation) (bool, error) {
+	if expected.OperationStateSeq == 0 {
+		return true, nil
+	}
+	register, err := e.harness.session.GetRegister(ctx, RegisterOpState, expected.Operation.OperationID)
+	if err != nil {
+		return false, err
+	}
+	return register != nil && register.Seq == expected.OperationStateSeq, nil
+}
+
+func (e *runtimeEffects) CommitTransition(ctx context.Context, current CurrentOperation, next OperationState, _ TelemetryContext, expectedConfigurationSeq, expectedSettingsRevision *int64) (*CurrentOperation, error) {
 	if current.Operation.OperationID == "" {
 		return nil, fmt.Errorf("transition has no operation")
 	}
-	if err := e.harness.commitState(ctx, e.lane, current.Operation.OperationID, next); err != nil {
+	if expectedConfigurationSeq != nil && *expectedConfigurationSeq != current.ConfigurationSeq {
+		return nil, nil
+	}
+	if expectedSettingsRevision != nil && *expectedSettingsRevision != e.harness.settings.Snapshot().SettingsRevision {
+		return nil, nil
+	}
+	var commit CommitResult
+	if err := e.harness.line(e.lane.name).Do(ctx, func() error {
+		valid, err := e.current(ctx, current)
+		if err != nil || !valid {
+			return err
+		}
+		commit, err = e.harness.session.Commit(ctx, Transaction{Writes: []Write{registerSet(RegisterOpState, current.Operation.OperationID, next)}})
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	current.State = next
+	if len(commit.Seqs) != 0 {
+		current.OperationStateSeq = commit.Seqs[len(commit.Seqs)-1]
+	}
 	return &current, nil
 }
 
@@ -628,7 +696,14 @@ func (e *runtimeEffects) CommitEffectSettlement(ctx context.Context, current Cur
 	entry := Entry{EntryBase: EntryBase{ID: responseID, ParentID: stringPointer(plan.Generation.Context.TriggerEntryID), Type: EntryMessage}, Message: messageCopy(message)}
 	next := OperationState{Kind: OperationRun, Run: &RunState{Kind: OperationRun, Control: Control{Status: ControlRunning}, Phase: RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationMayFinish}, TriggerEntryID: responseID}}, Inbox: Inbox{}, LatestAssistantEntryID: &responseID}}
 	if err := e.harness.line(e.lane.name).Do(ctx, func() error {
-		_, err := e.harness.session.Commit(ctx, Transaction{Writes: []Write{Write{Kind: WriteEntry, Entry: &EntryWrite{Entry: entry}}, Write{Kind: WriteUsage, Usage: &UsageWrite{Row: UsageRow{ID: usageID, Usage: usage, EntryID: &responseID}}}, registerSet(RegisterLaneLeaf, e.lane.name, stringPointer(responseID)), registerSet(RegisterOpState, current.Operation.OperationID, next)}})
+		valid, err := e.current(ctx, current)
+		if err != nil || !valid {
+			return err
+		}
+		commit, err := e.harness.session.Commit(ctx, Transaction{Writes: []Write{Write{Kind: WriteEntry, Entry: &EntryWrite{Entry: entry}}, Write{Kind: WriteUsage, Usage: &UsageWrite{Row: UsageRow{ID: usageID, Usage: usage, EntryID: &responseID}}}, registerSet(RegisterLaneLeaf, e.lane.name, stringPointer(responseID)), registerSet(RegisterOpState, current.Operation.OperationID, next)}})
+		if len(commit.Seqs) != 0 {
+			current.OperationStateSeq = commit.Seqs[len(commit.Seqs)-1]
+		}
 		return err
 	}); err != nil {
 		return SettlementResult{}, err
@@ -657,7 +732,14 @@ func (e *runtimeEffects) CommitTerminal(ctx context.Context, current CurrentOper
 		}
 	}
 	writes := append(cleanup, registerSet(RegisterLaneLastResult, e.lane.name, LaneLastResult{OperationID: current.Operation.OperationID, Kind: OperationRun, Outcome: run.Kind, LeafID: run.LeafID, FinalAssistantEntryID: run.FinalEntryID, RunCompletion: "assistant"}), registerSet(RegisterLaneState, e.lane.name, laneState))
-	if err := e.harness.line(e.lane.name).Do(ctx, func() error { _, err := e.harness.session.Commit(ctx, Transaction{Writes: writes}); return err }); err != nil {
+	if err := e.harness.line(e.lane.name).Do(ctx, func() error {
+		valid, err := e.current(ctx, current)
+		if err != nil || !valid {
+			return err
+		}
+		_, err = e.harness.session.Commit(ctx, Transaction{Writes: writes})
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	e.lane.finish()
@@ -766,7 +848,9 @@ func (h *Harness) failOperation(ctx context.Context, lane *runtimeLane, operatio
 		}
 	}
 	writes = append(writes, registerSet(RegisterLaneLastResult, lane.name, LaneLastResult{OperationID: operation.OperationID, Kind: OperationRun, Outcome: result.Kind, LeafID: result.LeafID, FinalAssistantEntryID: result.FinalEntryID, Error: errorValue}), registerSet(RegisterLaneState, lane.name, laneState))
-	if err := h.line(lane.name).Do(ctx, func() error { _, err := h.session.Commit(ctx, Transaction{Writes: writes}); return err }); err != nil {
+	if err := h.effect(ctx, ActionInfo{Kind: "terminal", Description: "failed operation"}, func(ctx context.Context) error {
+		return h.line(lane.name).Do(ctx, func() error { _, err := h.session.Commit(ctx, Transaction{Writes: writes}); return err })
+	}); err != nil {
 		return RunOutcome{}, err
 	}
 	lane.finish()

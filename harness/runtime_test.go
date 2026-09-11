@@ -119,7 +119,7 @@ func TestHarnessManualDriveParksBeforeProvider(t *testing.T) {
 	if calls := models.Calls(); calls != 0 {
 		t.Fatalf("provider ran while manual action was parked: %d", calls)
 	}
-	for i := 0; i < 8; i++ {
+	for i := 0; i < 12; i++ {
 		if _, err := harness.ExecuteAction(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -134,20 +134,20 @@ func TestHarnessManualDriveParksBeforeProvider(t *testing.T) {
 			return
 		default:
 		}
-		if models.Calls() == 1 {
-			for {
-				select {
-				case result := <-done:
-					if !result.OK {
-						t.Fatalf("manual prompt failed: %+v", result)
-					}
-					return
-				case <-time.After(time.Second):
-					t.Fatal("manual prompt did not finish")
-				}
+		select {
+		case result := <-done:
+			if !result.OK {
+				t.Fatalf("manual prompt failed: %+v", result)
+			}
+			if models.Calls() != 1 {
+				t.Fatalf("provider calls = %d, want 1", models.Calls())
+			}
+			return
+		default:
+			if waitForActionOrDone(t, harness, done) {
+				return
 			}
 		}
-		waitForAction(t, harness)
 	}
 	t.Fatal("manual prompt did not complete")
 }
@@ -162,4 +162,25 @@ func waitForAction(t *testing.T, harness *Harness) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("manual action was not scheduled")
+}
+
+func waitForActionOrDone(t *testing.T, harness *Harness, done <-chan Result[RunOutcome, error]) bool {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if harness.scheduler.Peek() != nil {
+			return false
+		}
+		select {
+		case result := <-done:
+			if !result.OK {
+				t.Fatalf("manual prompt failed: %+v", result)
+			}
+			return true
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	t.Fatal("manual action was not scheduled")
+	return false
 }
