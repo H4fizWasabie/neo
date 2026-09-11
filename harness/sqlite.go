@@ -124,7 +124,12 @@ func openSQLiteStorage(path string, metadata SessionMetadata, options SQLiteStor
 		go storage.renewLeaseLoop()
 	}
 	if !create {
-		if err := storage.loadShadow(); err != nil {
+		if claimLease {
+			if err := storage.loadShadow(); err != nil {
+				storage.Close(context.Background())
+				return nil, SessionMetadata{}, err
+			}
+		} else if err := storage.loadSnapshotShadow(); err != nil {
 			storage.Close(context.Background())
 			return nil, SessionMetadata{}, err
 		}
@@ -450,8 +455,33 @@ func insertFullBranch(ctx context.Context, conn *sql.Conn, leaf string) error {
 	return nil
 }
 
+type sqliteReader interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
 func (s *SQLiteStorage) loadShadow() error {
-	rows, err := s.db.Query(`SELECT id, seq, parent_id, type, custom_type, timestamp, payload FROM entries ORDER BY seq`)
+	return s.loadShadowFrom(s.db)
+}
+
+func (s *SQLiteStorage) loadSnapshotShadow() error {
+	tx, err := s.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	if err := s.loadShadowFrom(tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *SQLiteStorage) loadShadowFrom(reader sqliteReader) error {
+	var storedNextSeq int64
+	if err := reader.QueryRowContext(context.Background(), `SELECT next_seq FROM session LIMIT 1`).Scan(&storedNextSeq); err != nil {
+		return err
+	}
+	rows, err := reader.QueryContext(context.Background(), `SELECT id, seq, parent_id, type, custom_type, timestamp, payload FROM entries ORDER BY seq`)
 	if err != nil {
 		return err
 	}
@@ -472,7 +502,7 @@ func (s *SQLiteStorage) loadShadow() error {
 		records = append(records, recordForEntry(entry))
 	}
 	rows.Close()
-	usageRows, err := s.db.Query(`SELECT id, seq, entry_id, adjustment, usage, details FROM usage_ledger ORDER BY seq`)
+	usageRows, err := reader.QueryContext(context.Background(), `SELECT id, seq, entry_id, adjustment, usage, details FROM usage_ledger ORDER BY seq`)
 	if err != nil {
 		return err
 	}
@@ -502,7 +532,7 @@ func (s *SQLiteStorage) loadShadow() error {
 		records = append(records, jsonlRecord{Kind: string(WriteUsage), ID: id, Seq: seq, Usage: &usage, EntryID: pointer, Adjustment: adjustment != 0, Details: value})
 	}
 	usageRows.Close()
-	registerRows, err := s.db.Query(`SELECT namespace, key, seq, value FROM registers ORDER BY seq`)
+	registerRows, err := reader.QueryContext(context.Background(), `SELECT namespace, key, seq, value FROM registers ORDER BY seq`)
 	if err != nil {
 		return err
 	}
@@ -523,7 +553,15 @@ func (s *SQLiteStorage) loadShadow() error {
 	}
 	registerRows.Close()
 	sort.Slice(records, func(i, j int) bool { return records[i].Seq < records[j].Seq })
-	return s.memoryReplay(records)
+	if err := s.memoryReplay(records); err != nil {
+		return err
+	}
+	s.memory.data.mu.Lock()
+	if s.memory.data.nextSeq < storedNextSeq {
+		s.memory.data.nextSeq = storedNextSeq
+	}
+	s.memory.data.mu.Unlock()
+	return nil
 }
 
 func (s *SQLiteStorage) memoryReplay(records []jsonlRecord) error {
@@ -757,15 +795,126 @@ func (s *SQLiteStorage) VacuumInto(ctx context.Context, destination string) erro
 }
 
 func (s *SQLiteStorage) ScanBranchStructure(ctx context.Context, query BranchScan) ([]EntryStructure, error) {
-	entries, err := s.ScanBranch(ctx, query)
+	if query.Start == "" {
+		return nil, fmt.Errorf("branch scan start is required")
+	}
+	branchID, upper, err := s.resolveBranch(ctx, query.Start)
 	if err != nil {
 		return nil, err
 	}
-	result := make([]EntryStructure, len(entries))
-	for i, entry := range entries {
-		result[i] = structureOf(entry)
+	structures := make([]EntryStructure, 0)
+	for branchID != "" {
+		var base sql.NullString
+		var baseSeq int64
+		err := s.db.QueryRowContext(ctx, `SELECT base_branch_id, base_seq FROM branch_meta WHERE branch_id = ?`, branchID).Scan(&base, &baseSeq)
+		if err == sql.ErrNoRows {
+			base = sql.NullString{}
+			baseSeq = 0
+		} else if err != nil {
+			return nil, err
+		}
+		segmentUpper := upper
+		rows, err := s.db.QueryContext(ctx, `SELECT e.id, e.parent_id, e.seq, e.type, COALESCE(e.custom_type, ''), e.timestamp FROM branch_entries b CROSS JOIN entries e ON e.id = b.entry_id WHERE b.branch_id = ? AND b.entry_seq > ? AND b.entry_seq <= ? ORDER BY b.entry_seq DESC`, branchID, int64(0), segmentUpper)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var structure EntryStructure
+			var parent sql.NullString
+			if err := rows.Scan(&structure.ID, &parent, &structure.Seq, &structure.Type, &structure.CustomType, &structure.Timestamp); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			structure.ParentID = nullablePointer(parent)
+			structures = append(structures, structure)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+		if !base.Valid {
+			break
+		}
+		if baseSeq > 0 && baseSeq < upper {
+			upper = baseSeq
+		}
+		branchID = base.String
 	}
-	return result, nil
+	if err := validateStructurePath(structures, query.Start); err != nil {
+		return nil, err
+	}
+	return filterBranchStructures(structures, query), nil
+}
+
+func (s *SQLiteStorage) resolveBranch(ctx context.Context, start string) (string, int64, error) {
+	var upper int64
+	if err := s.db.QueryRowContext(ctx, `SELECT seq FROM entries WHERE id = ?`, start).Scan(&upper); err != nil {
+		return "", 0, err
+	}
+	branchID := start
+	var exists int
+	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM branch_meta WHERE branch_id = ?`, branchID).Scan(&exists); err == sql.ErrNoRows {
+		if err := s.db.QueryRowContext(ctx, `SELECT branch_id FROM branch_entries WHERE entry_id = ? LIMIT 1`, start).Scan(&branchID); err != nil {
+			return "", 0, err
+		}
+	} else if err != nil {
+		return "", 0, err
+	}
+	return branchID, upper, nil
+}
+
+func validateStructurePath(entries []EntryStructure, start string) error {
+	if len(entries) == 0 || entries[0].ID != start {
+		return sessionError(SessionInvalidEntry, fmt.Errorf("branch cache has no complete path for %s", start))
+	}
+	seen := make(map[string]struct{}, len(entries))
+	for i, entry := range entries {
+		if _, ok := seen[entry.ID]; ok {
+			return sessionError(SessionInvalidEntry, fmt.Errorf("branch cache repeats entry %s", entry.ID))
+		}
+		seen[entry.ID] = struct{}{}
+		if i+1 < len(entries) {
+			if entry.ParentID == nil || *entry.ParentID != entries[i+1].ID {
+				return sessionError(SessionInvalidEntry, fmt.Errorf("branch cache has a broken parent chain at %s", entry.ID))
+			}
+		} else if entry.ParentID != nil {
+			return sessionError(SessionInvalidEntry, fmt.Errorf("branch cache path does not reach the root at %s", entry.ID))
+		}
+	}
+	return nil
+}
+
+func filterBranchStructures(entries []EntryStructure, query BranchScan) []EntryStructure {
+	end := len(entries)
+	for i, entry := range entries {
+		if query.StopAtID != "" && entry.ID == query.StopAtID || query.StopAtType != nil && entry.Type == *query.StopAtType {
+			end = i + 1
+			break
+		}
+	}
+	entries = entries[:end]
+	if isOldestFirst(query.Order) {
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Seq < entries[j].Seq })
+	}
+	result := entries[:0]
+	for _, entry := range entries {
+		if query.Type != nil && entry.Type != *query.Type || query.CustomType != "" && entry.CustomType != query.CustomType {
+			continue
+		}
+		if query.Cursor != nil && (isOldestFirst(query.Order) && entry.Seq <= query.Cursor.AfterSeq || !isOldestFirst(query.Order) && entry.Seq >= query.Cursor.AfterSeq) {
+			continue
+		}
+		result = append(result, entry)
+	}
+	return limitStructures(result, query.Limit)
+}
+
+func limitStructures(entries []EntryStructure, limit int) []EntryStructure {
+	if limit > 0 && len(entries) > limit {
+		return entries[:limit]
+	}
+	return entries
 }
 
 func filterBranchEntries(entries []Entry, query BranchScan) []Entry {
@@ -808,8 +957,12 @@ func (s *SQLiteStorage) Close(ctx context.Context) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	memoryErr := s.memory.Close(context.Background())
 	if !s.leased {
-		return s.db.Close()
+		if err := s.db.Close(); err != nil {
+			return err
+		}
+		return memoryErr
 	}
 	conn, err := s.db.Conn(ctx)
 	if err == nil {
@@ -825,7 +978,10 @@ func (s *SQLiteStorage) Close(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return closeErr
+	if closeErr != nil {
+		return closeErr
+	}
+	return memoryErr
 }
 
 type SQLiteSessionRepo struct {
@@ -1053,6 +1209,101 @@ func (r *SQLiteSessionRepo) Fork(ctx context.Context, source SessionMetadata, op
 		}
 	}
 	return created, nil
+}
+
+// Rewrite copies a retained coherent snapshot into a fresh file and atomically
+// replaces the source file. It is administrative tooling; runtime transitions
+// never use it.
+func (r *SQLiteSessionRepo) Rewrite(ctx context.Context, source SessionMetadata, keep func(kind, id string) bool) (Session, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	sourceStorage, stored, err := openSQLiteSnapshot(r.path(source.ID), r.options)
+	if err != nil {
+		return nil, err
+	}
+	sourceSession := newSession(stored, sourceStorage)
+	defer sourceSession.Close(ctx)
+	entries, err := sourceSession.FindEntries(ctx, EntryQuery{Order: OldestFirst})
+	if err != nil {
+		return nil, err
+	}
+	selected := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		selected[entry.ID] = keep == nil || keep("entry", entry.ID)
+		if selected[entry.ID] && entry.ParentID != nil && !selected[*entry.ParentID] {
+			return nil, sessionError(SessionInvalidForkTarget, fmt.Errorf("rewrite would orphan retained entry %s", entry.ID))
+		}
+	}
+	usage, err := sourceSession.storage.ScanUsage(ctx, UsageScan{Order: OldestFirst})
+	if err != nil {
+		return nil, err
+	}
+	registers := make([]Register, 0)
+	for _, namespace := range []RegisterNamespace{RegisterLaneLeaf, RegisterLaneConfig, RegisterFactName, RegisterFactLabel, RegisterFactCustom} {
+		values, err := sourceSession.ListRegisters(ctx, namespace, "")
+		if err != nil {
+			return nil, err
+		}
+		registers = append(registers, values...)
+	}
+	temporary, err := os.CreateTemp(r.dir, source.ID+".rewrite-*.sqlite")
+	if err != nil {
+		return nil, err
+	}
+	temporaryPath := temporary.Name()
+	if err := temporary.Close(); err != nil {
+		os.Remove(temporaryPath)
+		return nil, err
+	}
+	if err := os.Remove(temporaryPath); err != nil {
+		return nil, err
+	}
+	defer os.Remove(temporaryPath)
+	rewritten, err := CreateSQLiteStorage(temporaryPath, stored, r.options)
+	if err != nil {
+		return nil, err
+	}
+	writes := make([]Write, 0, len(entries)+len(usage)+len(registers)*2)
+	for _, entry := range entries {
+		if selected[entry.ID] {
+			entry.Seq, entry.Timestamp = 0, 0
+			writes = append(writes, Write{Kind: WriteEntry, Entry: &EntryWrite{Entry: entry}})
+		}
+	}
+	for _, row := range usage {
+		if (keep == nil || keep("usage", row.ID)) && (row.EntryID == nil || selected[*row.EntryID]) {
+			row.Seq = 0
+			writes = append(writes, Write{Kind: WriteUsage, Usage: &UsageWrite{Row: row}})
+		}
+	}
+	for _, register := range registers {
+		if register.Namespace == RegisterFactLabel && !selected[register.Key] {
+			continue
+		}
+		if register.Namespace == RegisterLaneLeaf {
+			value, ok := register.Value.(*string)
+			if !ok || value == nil || !selected[*value] {
+				value = nil
+			}
+			writes = append(writes, registerSet(RegisterLaneLeaf, register.Key, value), registerSet(RegisterLaneState, register.Key, LaneState{PendingNextRun: []string{}}))
+			continue
+		}
+		writes = append(writes, registerSet(register.Namespace, register.Key, register.Value))
+	}
+	if len(writes) > 0 {
+		if _, err := rewritten.Commit(ctx, Transaction{Writes: writes}); err != nil {
+			_ = rewritten.Close(ctx)
+			return nil, err
+		}
+	}
+	if err := rewritten.Close(ctx); err != nil {
+		return nil, err
+	}
+	if err := os.Rename(temporaryPath, r.path(source.ID)); err != nil {
+		return nil, err
+	}
+	return r.Open(ctx, stored)
 }
 
 func nullString(value string) any {

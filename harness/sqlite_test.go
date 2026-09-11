@@ -20,6 +20,10 @@ func TestSQLiteRepositoryPersistsConformingSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	metadata := session.Metadata()
+	deleted, err := session.Commit(ctx, Transaction{Writes: []Write{{Kind: WriteRegister, Register: &RegisterWrite{Operation: RegisterDelete, Namespace: RegisterFactCustom, Key: "absent"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := session.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -31,10 +35,28 @@ func TestSQLiteRepositoryPersistsConformingSession(t *testing.T) {
 	if err != nil || entry == nil || entry.Message.Content != "sqlite" {
 		t.Fatalf("SQLite reopen failed: %v %+v", err, entry)
 	}
+	secondID, err := reopened.AppendMessage(ctx, AgentMessage{Role: "assistant", Content: "still monotonic"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := reopened.GetEntry(ctx, secondID)
+	if err != nil || second == nil || second.Seq <= deleted.Seqs[0] {
+		t.Fatalf("SQLite reused a sequence after reopening: %v %+v after %d", err, second, deleted.Seqs[0])
+	}
 	if _, err := reopened.FindEntriesOnBranch(ctx, BranchScan{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := reopened.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rewritten, err := repo.Rewrite(ctx, metadata, func(string, string) bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := rewritten.FindEntries(ctx, EntryQuery{Order: OldestFirst}); err != nil || len(got) != 2 {
+		t.Fatalf("rewrite lost entries: %v %+v", err, got)
+	}
+	if err := rewritten.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -130,7 +152,8 @@ func TestSQLiteBranchSegmentsRepairAndPlan(t *testing.T) {
 		plan = append(plan, detail)
 	}
 	rows.Close()
-	if len(plan) == 0 || strings.Contains(strings.Join(plan, "\n"), "USE TEMP B-TREE") {
+	planText := strings.Join(plan, "\n")
+	if len(plan) == 0 || strings.Contains(planText, "USE TEMP B-TREE") || strings.Contains(planText, "SCAN entries") || !strings.Contains(planText, "ix_branch_seq") || !strings.Contains(planText, "SEARCH e USING PRIMARY KEY") {
 		t.Fatalf("branch query plan regressed: %v", plan)
 	}
 	if _, err := storage.db.Exec(`DELETE FROM branch_entries; DELETE FROM branch_meta;`); err != nil {
