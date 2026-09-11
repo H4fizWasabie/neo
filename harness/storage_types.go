@@ -208,19 +208,21 @@ type BranchScan struct {
 }
 
 type EntryScan struct {
-	Type       *EntryType `json:"type,omitempty"`
-	CustomType string     `json:"customType,omitempty"`
-	FromSeq    int64      `json:"fromSeq,omitempty"`
-	ToSeq      int64      `json:"toSeq,omitempty"`
-	Order      EntryOrder `json:"order,omitempty"`
-	Limit      int        `json:"limit,omitempty"`
+	Type       *EntryType   `json:"type,omitempty"`
+	CustomType string       `json:"customType,omitempty"`
+	FromSeq    int64        `json:"fromSeq,omitempty"`
+	ToSeq      int64        `json:"toSeq,omitempty"`
+	Order      EntryOrder   `json:"order,omitempty"`
+	Limit      int          `json:"limit,omitempty"`
+	Cursor     *EntryCursor `json:"cursor,omitempty"`
 }
 
 type UsageScan struct {
-	FromSeq int64      `json:"fromSeq,omitempty"`
-	ToSeq   int64      `json:"toSeq,omitempty"`
-	Order   EntryOrder `json:"order,omitempty"`
-	Limit   int        `json:"limit,omitempty"`
+	FromSeq int64        `json:"fromSeq,omitempty"`
+	ToSeq   int64        `json:"toSeq,omitempty"`
+	Order   EntryOrder   `json:"order,omitempty"`
+	Limit   int          `json:"limit,omitempty"`
+	Cursor  *EntryCursor `json:"cursor,omitempty"`
 }
 
 type Storage interface {
