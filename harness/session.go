@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const CurrentStorageVersion = 1
+const CurrentStorageVersion = 2
 
 type MemorySessionRepo struct {
 	mu       sync.RWMutex
@@ -59,15 +59,22 @@ func (r *MemorySessionRepo) Open(ctx context.Context, metadata SessionMetadata) 
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
-	r.mu.RLock()
+	r.mu.Lock()
 	data := r.sessions[metadata.ID]
 	stored, ok := r.metadata[metadata.ID]
-	r.mu.RUnlock()
+	defer r.mu.Unlock()
 	if !ok {
 		return nil, sessionError(SessionNotFound, fmt.Errorf("session not found: %s", metadata.ID))
 	}
 	if stored.StorageVersion > CurrentStorageVersion {
 		return nil, sessionError(SessionStorageFailure, fmt.Errorf("session storage version %d is newer than binary version %d", stored.StorageVersion, CurrentStorageVersion))
+	}
+	if stored.StorageVersion < CurrentStorageVersion {
+		if err := migrateMemoryStorage(ctx, data, stored.StorageVersion); err != nil {
+			return nil, err
+		}
+		stored.StorageVersion = CurrentStorageVersion
+		r.metadata[metadata.ID] = stored
 	}
 	return newMemorySession(stored, newMemoryStorage(data, r.codec, r.now)), nil
 }

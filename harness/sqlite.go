@@ -123,6 +123,13 @@ func openSQLiteStorage(path string, metadata SessionMetadata, options SQLiteStor
 		storage.leaseDone = make(chan struct{})
 		go storage.renewLeaseLoop()
 	}
+	if !create && claimLease && metadata.StorageVersion < CurrentStorageVersion {
+		if err := migrateSQLiteStorage(context.Background(), storage, metadata.StorageVersion); err != nil {
+			storage.Close(context.Background())
+			return nil, SessionMetadata{}, err
+		}
+		metadata = storage.session
+	}
 	if !create {
 		if claimLease {
 			if err := storage.loadShadow(); err != nil {
@@ -135,6 +142,28 @@ func openSQLiteStorage(path string, metadata SessionMetadata, options SQLiteStor
 		}
 	}
 	return storage, metadata, nil
+}
+
+func migrateSQLiteStorage(ctx context.Context, storage *SQLiteStorage, version int) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	if version == 0 {
+		version = 1
+	}
+	for version < CurrentStorageVersion {
+		switch version {
+		case 1:
+			if _, err := storage.db.ExecContext(ctx, `UPDATE session SET storage_version = ? WHERE storage_version = ?`, CurrentStorageVersion, version); err != nil {
+				return err
+			}
+			version++
+		default:
+			return fmt.Errorf("no migration registered for storage version %d", version)
+		}
+	}
+	storage.session.StorageVersion = CurrentStorageVersion
+	return nil
 }
 
 const sqliteSchema = `
