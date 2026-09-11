@@ -78,6 +78,7 @@ type SettlementOutput struct {
 	Kind       string
 	Key        EffectKey
 	Message    *AgentMessage
+	Phase      RunPhase
 	Summary    *SummaryAttemptOutcome
 	ToolResult *AgentToolResult
 	IsError    bool

@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -32,6 +33,8 @@ type Harness struct {
 	effects            sync.WaitGroup
 }
 
+const maxSafeInteger = int64(9007199254740991)
+
 type runtimeLane struct {
 	harness *Harness
 	name    string
@@ -59,6 +62,13 @@ func NewHarness(ctx context.Context, options AgentHarnessOptions) (*Harness, []S
 	if options.Retry.MaxRetries < 0 {
 		return nil, nil, fmt.Errorf("retry max cannot be negative")
 	}
+	if options.Retry.BaseDelayMs < 0 || options.Retry.BaseDelayMs > maxSafeInteger || options.Retry.MaxRetries > maxSafeInteger-1 {
+		return nil, nil, fmt.Errorf("retry policy exceeds safe limits")
+	}
+	maxAttempts := int64(1)
+	if options.Retry.Enabled {
+		maxAttempts = options.Retry.MaxRetries + 1
+	}
 	rootCtx, cancel := context.WithCancel(context.Background())
 	h := &Harness{
 		session:            options.Session,
@@ -66,7 +76,7 @@ func NewHarness(ctx context.Context, options AgentHarnessOptions) (*Harness, []S
 		systemPrompt:       options.SystemPrompt,
 		toProviderMessages: options.ToProviderMessages,
 		telemetry:          options.Telemetry,
-		settings:           NewSettingsSnapshot(options.StreamOptions, NormalizedRetryPolicy{MaxAttempts: options.Retry.MaxRetries + 1, BaseDelayMs: options.Retry.BaseDelayMs}),
+		settings:           NewSettingsSnapshot(options.StreamOptions, NormalizedRetryPolicy{MaxAttempts: maxAttempts, BaseDelayMs: options.Retry.BaseDelayMs}),
 		tools:              append([]AgentHarnessTool(nil), options.Tools...),
 		resources:          cloneValue(options.Resources).(Resources),
 		compaction:         options.Compaction,
@@ -89,6 +99,7 @@ func NewHarness(ctx context.Context, options AgentHarnessOptions) (*Harness, []S
 		cancel()
 		return nil, nil, err
 	} else if restored.Current != nil {
+		main.begin()
 		suspended = append(suspended, SuspendedOperation{Lane: "main", OperationID: restored.Current.Operation.OperationID, Kind: restored.Current.Operation.Intent.Kind, Reason: "crash", StartedAt: restored.Current.Operation.StartedAt})
 	}
 	return h, suspended, nil
@@ -468,106 +479,262 @@ func applyStreamOptions(options AgentHarnessStreamOptions, patch AgentHarnessStr
 
 func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operation, state OperationState) (RunOutcome, error) {
 	fx := &runtimeEffects{harness: h, lane: lane}
-	restored, err := Restore(ctx, h.session, lane.name)
-	if err != nil || restored.Current == nil {
+	for {
+		restored, err := Restore(ctx, h.session, lane.name)
 		if err != nil {
 			return RunOutcome{}, err
 		}
-		return RunOutcome{}, fmt.Errorf("operation disappeared before drive")
+		if restored.Current == nil {
+			return RunOutcome{}, fmt.Errorf("operation disappeared before drive")
+		}
+		current := *restored.Current
+		state = current.State
+		if state.Run == nil {
+			return RunOutcome{}, fmt.Errorf("run state disappeared before drive")
+		}
+		phase := state.Run.Phase
+		if phase.Kind == PhaseFailureDrain {
+			if phase.Error != nil {
+				return h.finishFailureValue(ctx, lane, operation, current, phase.Error)
+			}
+			return h.finishFailure(ctx, lane, operation, current, fmt.Errorf("operation failed"))
+		}
+		if phase.Kind == PhaseDeferred {
+			if phase.Deferred == nil || phase.Deferred.Status != DeferredSuspended {
+				return RunOutcome{}, fmt.Errorf("deferred state is not resumable")
+			}
+			entry, err := lane.view.GetEntry(ctx, phase.Deferred.SourceEntryID)
+			if err != nil || entry == nil || entry.Message == nil {
+				if err == nil {
+					err = fmt.Errorf("deferred source entry is missing")
+				}
+				return RunOutcome{}, err
+			}
+			handle, ok := deferredHandle(*entry.Message)
+			if !ok {
+				return RunOutcome{}, fmt.Errorf("deferred source entry has no valid handle")
+			}
+			return RunOutcome{Kind: "suspended", RunID: operation.OperationID, LeafID: stringPointer(phase.Deferred.SourceEntryID), FinalEntryID: stringPointer(phase.Deferred.SourceEntryID), FinalMessage: messageCopy(*entry.Message), Reason: "deferred", Deferred: handle}, nil
+		}
+		if phase.Kind == PhaseCheckpoint {
+			if phase.Checkpoint == nil {
+				return h.finishFailure(ctx, lane, operation, current, fmt.Errorf("checkpoint has no payload"))
+			}
+			if phase.Checkpoint.Continuation.Kind == ContinuationMayFinish {
+				if state.Run.LatestAssistantEntryID == nil {
+					return h.finishFailure(ctx, lane, operation, current, fmt.Errorf("checkpoint has no final assistant"))
+				}
+				entry, err := lane.view.GetEntry(ctx, *state.Run.LatestAssistantEntryID)
+				if err != nil || entry == nil || entry.Message == nil {
+					if err == nil {
+						err = fmt.Errorf("final assistant entry is missing")
+					}
+					return RunOutcome{}, err
+				}
+				result := RunOutcome{Kind: "completed", RunID: operation.OperationID, LeafID: current.LeafID, FinalEntryID: state.Run.LatestAssistantEntryID, FinalMessage: messageCopy(*entry.Message)}
+				return h.finishOutcome(ctx, lane, operation, current, result)
+			}
+			if phase.Checkpoint.Continuation.Kind != ContinuationNeedAssistant {
+				return h.finishFailure(ctx, lane, operation, current, fmt.Errorf("unsupported checkpoint continuation"))
+			}
+			config := current.Configuration
+			settings := h.settings.Snapshot()
+			generation := &Generation{Status: GenerationReady, NextAttempt: 1, Context: GenerationContext{StepID: operation.OperationID + ":step:1", TriggerEntryID: phase.Checkpoint.TriggerEntryID, Configuration: config, StreamOptions: settings.StreamOptions, RetryPolicy: settings.RetryPolicy}}
+			next := state
+			next.Run.Phase = RunPhase{Kind: PhaseAssistant, Generation: generation}
+			var transition *CurrentOperation
+			configurationSeq, settingsRevision := current.ConfigurationSeq, settings.SettingsRevision
+			if err := h.effect(ctx, ActionInfo{Kind: "transition", Description: "assistant ready"}, func(ctx context.Context) error {
+				var err error
+				transition, err = fx.CommitTransition(ctx, current, next, h.telemetry, &configurationSeq, &settingsRevision)
+				return err
+			}); err != nil {
+				return RunOutcome{}, err
+			}
+			if transition == nil {
+				return RunOutcome{}, fmt.Errorf("assistant ready transition lost its compare-and-swap")
+			}
+			h.events.Emit(ctx, HarnessEvent{Type: string(EventTurnStart), Lane: lane.name, Payload: map[string]JSONValue{"runId": operation.OperationID, "turnId": generation.Context.StepID}})
+			continue
+		}
+		generation := phase.Generation
+		if phase.Kind != PhaseAssistant || generation == nil {
+			return h.finishFailure(ctx, lane, operation, current, fmt.Errorf("unsupported run phase %q", phase.Kind))
+		}
+		if generation.Status == GenerationRetryWait {
+			if delay := generation.NotBefore - time.Now().UnixMilli(); delay > 0 {
+				if err := h.effect(ctx, ActionInfo{Kind: "wait", Description: "assistant retry wait"}, func(ctx context.Context) error { return fx.Sleep(ctx, delay, h.telemetry) }); err != nil {
+					return RunOutcome{}, err
+				}
+			}
+			next := state
+			next.Run.Phase.Generation.Status = GenerationReady
+			var transition *CurrentOperation
+			if err := h.effect(ctx, ActionInfo{Kind: "transition", Description: "assistant retry ready"}, func(ctx context.Context) error {
+				var err error
+				transition, err = fx.CommitTransition(ctx, current, next, h.telemetry, nil, nil)
+				return err
+			}); err != nil {
+				return RunOutcome{}, err
+			}
+			if transition == nil {
+				return RunOutcome{}, fmt.Errorf("assistant retry transition lost its compare-and-swap")
+			}
+			continue
+		}
+		if generation.Status == GenerationEffectPending {
+			if generation.Attempt >= generation.Context.RetryPolicy.MaxAttempts {
+				return h.settleGenerationError(ctx, lane, operation, current, *generation, fmt.Errorf("recovered assistant effect reached retry cap"))
+			}
+			next := state
+			next.Run.Phase.Generation.Status = GenerationReady
+			next.Run.Phase.Generation.NextAttempt = generation.Attempt + 1
+			next.Run.Phase.Generation.Attempt = 0
+			next.Run.Phase.Generation.ResponseEntryID = ""
+			next.Run.Phase.Generation.UsageID = ""
+			var transition *CurrentOperation
+			if err := h.effect(ctx, ActionInfo{Kind: "recovery", Description: "recover assistant effect"}, func(ctx context.Context) error {
+				var err error
+				transition, err = fx.CommitTransition(ctx, current, next, h.telemetry, nil, nil)
+				return err
+			}); err != nil {
+				return RunOutcome{}, err
+			}
+			if transition == nil {
+				return RunOutcome{}, fmt.Errorf("assistant recovery transition lost its compare-and-swap")
+			}
+			continue
+		}
+		if generation.Status != GenerationReady {
+			return h.finishFailure(ctx, lane, operation, current, fmt.Errorf("unsupported generation status %q", generation.Status))
+		}
+		missingTools := missingActiveTools(h.tools, generation.Context.Configuration.ActiveToolNames)
+		_, modelErr := h.models.Resolve(ctx, generation.Context.Configuration.Model.Provider, generation.Context.Configuration.Model.ModelID)
+		if modelErr != nil || len(missingTools) != 0 {
+			missing := &MissingIdentitySuspension{Reason: "missing_identities", Tools: missingTools}
+			if modelErr != nil {
+				missing.Models = []string{generation.Context.Configuration.Model.Provider + "/" + generation.Context.Configuration.Model.ModelID}
+			}
+			return RunOutcome{Kind: "suspended", RunID: operation.OperationID, LeafID: current.LeafID, Reason: "missing_identities", Missing: missing}, nil
+		}
+		attempt := generation.NextAttempt
+		if attempt == 0 {
+			attempt = generation.Attempt + 1
+		}
+		if attempt > 1 {
+			h.events.Emit(ctx, HarnessEvent{Type: string(EventTurnStart), Lane: lane.name, Payload: map[string]JSONValue{"runId": operation.OperationID, "turnId": generation.Context.StepID}})
+		}
+		requestOptions := generation.Context.StreamOptions
+		if err := h.runBeforeRequest(ctx, fx, operation, attempt, &requestOptions); err != nil {
+			return h.finishFailure(ctx, lane, operation, current, err)
+		}
+		responseID, usageID := h.session.IDGenerator().Next(), h.session.IDGenerator().Next()
+		pending := state
+		pending.Run.Phase.Generation.Status = GenerationEffectPending
+		pending.Run.Phase.Generation.Attempt = attempt
+		pending.Run.Phase.Generation.NextAttempt = attempt
+		pending.Run.Phase.Generation.ResponseEntryID = responseID
+		pending.Run.Phase.Generation.UsageID = usageID
+		pending.Run.Phase.Generation.AttemptStreamOptions = &requestOptions
+		var transition *CurrentOperation
+		if err := h.effect(ctx, ActionInfo{Kind: "transition", Description: "assistant effect pending"}, func(ctx context.Context) error {
+			var err error
+			transition, err = fx.CommitTransition(ctx, current, pending, h.telemetry, nil, nil)
+			return err
+		}); err != nil {
+			return RunOutcome{}, err
+		}
+		if transition == nil {
+			return RunOutcome{}, fmt.Errorf("assistant intent lost its compare-and-swap")
+		}
+		current = *transition
+		message, err := h.runAssistantAttempt(ctx, lane, operation, pending, fx)
+		if err != nil {
+			if pending.Run.Control.Status == ControlCancelRequested {
+				return h.settleAborted(ctx, lane, operation, current, *pending.Run.Phase.Generation, AgentMessage{Role: "assistant", Content: err.Error()})
+			}
+			return h.settleGenerationError(ctx, lane, operation, current, *pending.Run.Phase.Generation, err)
+		}
+		if pending.Run.Control.Status == ControlCancelRequested {
+			message.StopReason = StopReasonAborted
+			return h.settleAborted(ctx, lane, operation, current, *pending.Run.Phase.Generation, message)
+		}
+		if err := validateAssistantMessage(message); err != nil {
+			return h.settleGenerationError(ctx, lane, operation, current, *pending.Run.Phase.Generation, terminalGenerationError{err})
+		}
+		if message.StopReason == StopReasonAborted {
+			return RunOutcome{}, h.lifecycle.Fault(fmt.Errorf("provider returned aborted while control is running"))
+		}
+		if message.StopReason == StopReasonError {
+			return h.settleGenerationErrorMessage(ctx, lane, operation, current, *pending.Run.Phase.Generation, message, fmt.Errorf("provider returned an error"))
+		}
+		if message.StopReason == StopReasonDeferred {
+			handle, ok := deferredHandle(message)
+			if !ok {
+				return h.settleGenerationError(ctx, lane, operation, current, *pending.Run.Phase.Generation, terminalGenerationError{fmt.Errorf("deferred response has no valid handle")})
+			}
+			return h.settleDeferred(ctx, lane, operation, current, *pending.Run.Phase.Generation, message, handle)
+		}
+		if len(message.ToolCalls) != 0 || message.StopReason == StopReasonToolUse {
+			return h.settleGenerationError(ctx, lane, operation, current, *pending.Run.Phase.Generation, terminalGenerationError{fmt.Errorf("tool calls are not supported by the no-tool run")})
+		}
+		result := RunOutcome{Kind: "completed", RunID: operation.OperationID, LeafID: stringPointer(pending.Run.Phase.Generation.ResponseEntryID), FinalEntryID: stringPointer(pending.Run.Phase.Generation.ResponseEntryID), FinalMessage: &message}
+		settled, err := h.settleGeneration(ctx, lane, operation, current, *pending.Run.Phase.Generation, message, RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationMayFinish, IncludeFinalAssistant: true}, TriggerEntryID: pending.Run.Phase.Generation.ResponseEntryID}})
+		if err != nil {
+			return RunOutcome{}, err
+		}
+		return h.finishOutcome(ctx, lane, operation, settled, result)
 	}
-	current := *restored.Current
-	configRegister, err := h.session.GetRegister(ctx, RegisterLaneConfig, lane.name)
-	if err != nil {
-		return RunOutcome{}, err
-	}
-	config := configRegister.Value.(LaneConfiguration)
-	settings := h.settings.Snapshot()
-	ready := state
-	ready.Run.Phase = RunPhase{Kind: PhaseAssistant, Generation: &Generation{Status: GenerationReady, NextAttempt: 1, Context: GenerationContext{StepID: operation.OperationID + ":step:1", TriggerEntryID: ready.Run.Phase.Checkpoint.TriggerEntryID, Configuration: config, StreamOptions: settings.StreamOptions, RetryPolicy: settings.RetryPolicy}}}
-	configurationSeq := current.ConfigurationSeq
-	settingsRevision := settings.SettingsRevision
-	var transition *CurrentOperation
-	if err := h.effect(ctx, ActionInfo{Kind: "transition", Description: "assistant ready"}, func(ctx context.Context) error {
-		var err error
-		transition, err = fx.CommitTransition(ctx, current, ready, h.telemetry, &configurationSeq, &settingsRevision)
-		return err
-	}); err != nil {
-		return RunOutcome{}, err
-	}
-	if transition == nil {
-		return RunOutcome{}, fmt.Errorf("assistant transition lost its compare-and-swap")
-	}
-	current = *transition
-	h.events.Emit(ctx, HarnessEvent{Type: string(EventTurnStart), Lane: lane.name, Payload: map[string]JSONValue{"runId": operation.OperationID, "turnId": ready.Run.Phase.Generation.Context.StepID}})
-	requestOptions := settings.StreamOptions
-	if err := h.effect(ctx, ActionInfo{Kind: "hook", Description: "before_request"}, func(ctx context.Context) error {
-		output, err := fx.Run(ctx, EffectPlan{Kind: EffectHook, Key: EffectKey(operation.OperationID + ":before_request"), HookName: HookBeforeRequest, Event: map[string]JSONValue{"step": "assistant", "attempt": int64(1), "streamOptions": requestOptions}})
-		result := output.Result
-		if values, ok := result.(map[string]JSONValue); ok {
+}
+
+func (h *Harness) runBeforeRequest(ctx context.Context, fx *runtimeEffects, operation Operation, attempt int64, options *AgentHarnessStreamOptions) error {
+	return h.effect(ctx, ActionInfo{Kind: "hook", Description: "before_request"}, func(ctx context.Context) error {
+		output, err := fx.Run(ctx, EffectPlan{Kind: EffectHook, Key: EffectKey(fmt.Sprintf("%s:before_request:%d", operation.OperationID, attempt)), HookName: HookBeforeRequest, Event: map[string]JSONValue{"step": "assistant", "attempt": attempt, "streamOptions": *options}})
+		if values, ok := output.Result.(map[string]JSONValue); ok {
 			if patch, ok := values["streamOptions"].(AgentHarnessStreamOptionsPatch); ok {
-				requestOptions = applyStreamOptions(requestOptions, patch)
+				*options = applyStreamOptions(*options, patch)
 			}
 		}
 		return err
-	}); err != nil {
-		return h.failOperation(ctx, lane, operation, ready, err)
-	}
-	responseID := h.session.IDGenerator().Next()
-	usageID := h.session.IDGenerator().Next()
-	pending := ready
-	pending.Run.Phase.Generation.Status = GenerationEffectPending
-	pending.Run.Phase.Generation.Attempt = 1
-	pending.Run.Phase.Generation.ResponseEntryID = responseID
-	pending.Run.Phase.Generation.UsageID = usageID
-	pending.Run.Phase.Generation.Context.StreamOptions = requestOptions
-	if err := h.effect(ctx, ActionInfo{Kind: "transition", Description: "assistant effect pending"}, func(ctx context.Context) error {
-		var err error
-		transition, err = fx.CommitTransition(ctx, current, pending, h.telemetry, nil, nil)
-		return err
-	}); err != nil {
-		return RunOutcome{}, err
-	}
-	if transition == nil {
-		return RunOutcome{}, fmt.Errorf("assistant intent lost its compare-and-swap")
-	}
-	current = *transition
+	})
+}
+
+func (h *Harness) runAssistantAttempt(ctx context.Context, lane *runtimeLane, operation Operation, pending OperationState, fx *runtimeEffects) (AgentMessage, error) {
+	generation := pending.Run.Phase.Generation
 	message := AgentMessage{Role: "assistant"}
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventMessageStart), Lane: lane.name, Payload: cloneValue(message)})
-	payload := JSONValue("provider-request")
 	if err := h.effect(ctx, ActionInfo{Kind: "hook", Description: "before_payload"}, func(ctx context.Context) error {
-		output, err := fx.Run(ctx, EffectPlan{Kind: EffectHook, Key: EffectKey(operation.OperationID + ":before_payload"), HookName: HookBeforePayload, Event: map[string]JSONValue{"model": pending.Run.Phase.Generation.Context.Configuration.Model, "payload": payload}})
-		if values, ok := output.Result.(map[string]JSONValue); ok {
-			if replacement, ok := values["payload"]; ok {
-				payload = replacement
-			}
-		}
+		_, err := fx.Run(ctx, EffectPlan{Kind: EffectHook, Key: EffectKey(operation.OperationID + ":before_payload"), HookName: HookBeforePayload, Event: map[string]JSONValue{"model": generation.Context.Configuration.Model, "payload": JSONValue("provider-request")}})
 		return err
 	}); err != nil {
-		return h.failOperation(ctx, lane, operation, pending, err)
+		return AgentMessage{}, terminalGenerationError{err}
 	}
 	if err := h.effect(ctx, ActionInfo{Kind: "provider", Description: "assistant stream"}, func(ctx context.Context) error {
-		entries, err := lane.view.FindEntriesOnBranch(ctx, BranchScan{Start: pending.Run.Phase.Generation.Context.TriggerEntryID, Order: OldestFirst})
+		entries, err := lane.view.FindEntriesOnBranch(ctx, BranchScan{Start: generation.Context.TriggerEntryID, Order: OldestFirst})
 		if err != nil {
 			return err
 		}
 		messages := make([]AgentMessage, 0, len(entries))
 		for _, entry := range entries {
-			if entry.Message != nil {
+			if entry.Message != nil && includeInContext(*entry.Message) {
 				messages = append(messages, *entry.Message)
 			}
 		}
 		if operation.Intent.SystemPromptOverride != "" {
 			messages = append([]AgentMessage{{Role: "system", Content: operation.Intent.SystemPromptOverride}}, messages...)
 		}
-		providerMessages := make([]Message, len(messages))
-		copy(providerMessages, messages)
+		providerMessages := append([]Message(nil), messages...)
 		if h.toProviderMessages != nil {
 			providerMessages, err = h.toProviderMessages(messages)
 			if err != nil {
-				return err
+				return terminalGenerationError{err}
 			}
 		}
-		output, err := fx.Run(ctx, EffectPlan{Kind: EffectAssistant, Key: EffectKey(operation.OperationID + ":assistant"), Model: pending.Run.Phase.Generation.Context.Configuration.Model, Messages: providerMessages, StreamOptions: pending.Run.Phase.Generation.Context.StreamOptions})
+		streamOptions := generation.Context.StreamOptions
+		if generation.AttemptStreamOptions != nil {
+			streamOptions = *generation.AttemptStreamOptions
+		}
+		output, err := fx.Run(ctx, EffectPlan{Kind: EffectAssistant, Key: EffectKey(fmt.Sprintf("%s:assistant:%d", operation.OperationID, generation.Attempt)), Model: generation.Context.Configuration.Model, Messages: providerMessages, StreamOptions: streamOptions})
 		if err != nil {
 			return err
 		}
@@ -577,62 +744,39 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 		message = *output.Message
 		return nil
 	}); err != nil {
-		return h.failOperation(ctx, lane, operation, pending, err)
+		return AgentMessage{}, err
 	}
 	if err := h.effect(ctx, ActionInfo{Kind: "hook", Description: "after_response"}, func(ctx context.Context) error {
 		output, err := fx.Run(ctx, EffectPlan{Kind: EffectHook, Key: EffectKey(operation.OperationID + ":after_response"), HookName: HookAfterResponse, Event: map[string]JSONValue{"message": message}})
-		if err != nil {
-			return err
-		}
-		result := output.Result
-		if patch, ok := result.(map[string]JSONValue); ok {
-			if replacement, ok := patch["message"].(AgentMessage); ok {
+		if values, ok := output.Result.(map[string]JSONValue); ok {
+			if replacement, ok := values["message"].(AgentMessage); ok {
 				message = replacement
 			}
 		}
-		return nil
+		return err
 	}); err != nil {
-		return h.failOperation(ctx, lane, operation, pending, err)
+		return AgentMessage{}, terminalGenerationError{err}
+	}
+	if message.Role == "" {
+		message.Role = "assistant"
 	}
 	if message.StopReason == "" {
 		message.StopReason = StopReasonStop
 	}
-	if message.StopReason != StopReasonStop && message.StopReason != StopReasonLength {
-		return h.failOperation(ctx, lane, operation, pending, fmt.Errorf("unsupported assistant stop reason %q", message.StopReason))
-	}
-	if message.Role != "assistant" {
-		return h.failOperation(ctx, lane, operation, pending, fmt.Errorf("provider response has role %q", message.Role))
-	}
-	if len(message.ToolCalls) != 0 {
-		return h.failOperation(ctx, lane, operation, pending, fmt.Errorf("tool calls are not supported by the no-tool run"))
-	}
 	h.events.Emit(ctx, HarnessEvent{Type: string(EventMessageEnd), Lane: lane.name, Payload: cloneValue(message)})
-	usage := Usage{}
-	if message.Usage != nil {
-		usage = *message.Usage
+	return message, nil
+}
+
+func validateAssistantMessage(message AgentMessage) error {
+	if message.Role != "assistant" {
+		return fmt.Errorf("provider response has role %q", message.Role)
 	}
-	var settled SettlementResult
-	if err := h.effect(ctx, ActionInfo{Kind: "settlement", Description: "assistant response"}, func(ctx context.Context) error {
-		var err error
-		settled, err = fx.CommitEffectSettlement(ctx, current, EffectPlan{Kind: EffectAssistant, Key: EffectKey(operation.OperationID), Generation: pending.Run.Phase.Generation}, SettlementOutput{Kind: "assistant", Key: EffectKey(operation.OperationID), Message: &message}, h.telemetry)
-		return err
-	}); err != nil {
-		return RunOutcome{}, err
+	switch message.StopReason {
+	case StopReasonStop, StopReasonLength, StopReasonError, StopReasonAborted, StopReasonDeferred, StopReasonToolUse:
+		return nil
+	default:
+		return fmt.Errorf("unsupported assistant stop reason %q", message.StopReason)
 	}
-	current = settled.Current
-	entry := Entry{EntryBase: EntryBase{ID: responseID, ParentID: stringPointer(pending.Run.Phase.Generation.Context.TriggerEntryID), Type: EntryMessage}, Message: messageCopy(message)}
-	h.events.Emit(ctx, HarnessEvent{Type: string(EventEntryAdded), Lane: lane.name, Payload: cloneValue(entry)})
-	h.events.Emit(ctx, HarnessEvent{Type: string(EventUsage), Lane: lane.name, Payload: cloneValue(usage)})
-	h.events.Emit(ctx, HarnessEvent{Type: string(EventTurnEnd), Lane: lane.name, Payload: map[string]JSONValue{"runId": operation.OperationID, "turnId": pending.Run.Phase.Generation.Context.StepID}})
-	result := RunOutcome{Kind: "completed", RunID: operation.OperationID, LeafID: stringPointer(responseID), FinalEntryID: stringPointer(responseID), FinalMessage: &message}
-	if err := h.effect(ctx, ActionInfo{Kind: "terminal", Description: "assistant terminal"}, func(ctx context.Context) error {
-		_, err := fx.CommitTerminal(ctx, current, result)
-		return err
-	}); err != nil {
-		return RunOutcome{}, err
-	}
-	h.events.Emit(ctx, HarnessEvent{Type: string(EventRunEnd), Lane: lane.name, Payload: cloneValue(result)})
-	return result, nil
 }
 
 func (h *Harness) commitState(ctx context.Context, lane *runtimeLane, operationID string, state OperationState) error {
@@ -646,6 +790,10 @@ type runtimeEffects struct {
 	harness *Harness
 	lane    *runtimeLane
 }
+
+type terminalGenerationError struct{ error }
+
+func (e terminalGenerationError) Unwrap() error { return e.error }
 
 var _ Effects = (*runtimeEffects)(nil)
 
@@ -718,7 +866,16 @@ func (e *runtimeEffects) CommitEffectSettlement(ctx context.Context, current Cur
 		usage = *message.Usage
 	}
 	entry := Entry{EntryBase: EntryBase{ID: responseID, ParentID: stringPointer(plan.Generation.Context.TriggerEntryID), Type: EntryMessage}, Message: messageCopy(message)}
-	next := OperationState{Kind: OperationRun, Run: &RunState{Kind: OperationRun, Control: Control{Status: ControlRunning}, Phase: RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationMayFinish}, TriggerEntryID: responseID}}, Inbox: Inbox{}, LatestAssistantEntryID: &responseID}}
+	phase := output.Phase
+	if phase.Kind == "" {
+		phase = RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationMayFinish}, TriggerEntryID: responseID}}
+	}
+	next := current.State
+	if next.Run == nil {
+		return SettlementResult{}, fmt.Errorf("assistant settlement has no run state")
+	}
+	next.Run.Phase = phase
+	next.Run.LatestAssistantEntryID = &responseID
 	if err := e.harness.line(e.lane.name).Do(ctx, func() error {
 		valid, err := e.current(ctx, current)
 		if err != nil || !valid {
@@ -758,7 +915,11 @@ func (e *runtimeEffects) CommitTerminal(ctx context.Context, current CurrentOper
 			laneState.CurrentOperationID = nil
 		}
 	}
-	writes := append(cleanup, registerSet(RegisterLaneLastResult, e.lane.name, LaneLastResult{OperationID: current.Operation.OperationID, Kind: OperationRun, Outcome: run.Kind, LeafID: run.LeafID, FinalAssistantEntryID: run.FinalEntryID, RunCompletion: "assistant"}), registerSet(RegisterLaneState, e.lane.name, laneState))
+	completion := ""
+	if run.Kind == "completed" {
+		completion = "assistant"
+	}
+	writes := append(cleanup, registerSet(RegisterLaneLastResult, e.lane.name, LaneLastResult{OperationID: current.Operation.OperationID, Kind: OperationRun, Outcome: run.Kind, LeafID: run.LeafID, FinalAssistantEntryID: run.FinalEntryID, RunCompletion: completion, Error: run.Error}), registerSet(RegisterLaneState, e.lane.name, laneState))
 	if err := e.harness.line(e.lane.name).Do(ctx, func() error {
 		valid, err := e.current(ctx, current)
 		if err != nil || !valid {
@@ -947,8 +1108,54 @@ func (l *runtimeLane) Compact(context.Context, string) (Result[CompactionOutcome
 func (l *runtimeLane) NavigateTree(context.Context, *string, NavigateOptions) (Result[NavigationOutcome, error], error) {
 	return Err[NavigationOutcome](fmt.Errorf("navigation is not implemented")), nil
 }
-func (l *runtimeLane) Resume(context.Context) (Result[ResumeOutcome, error], error) {
-	return Err[ResumeOutcome](fmt.Errorf("resume is not implemented")), nil
+func (l *runtimeLane) Resume(ctx context.Context) (Result[ResumeOutcome, error], error) {
+	if err := l.harness.lifecycle.Err(); err != nil {
+		return Result[ResumeOutcome, error]{Err: err}, nil
+	}
+	restored, err := Restore(ctx, l.harness.session, l.name)
+	if err != nil {
+		return Result[ResumeOutcome, error]{Err: err}, nil
+	}
+	if restored.Current == nil {
+		return Result[ResumeOutcome, error]{Err: &NothingToResume{TaggedError: TaggedError{Message: "nothing to resume"}, Lane: l.name}}, nil
+	}
+	current := *restored.Current
+	if current.Operation.Intent.Kind != OperationRun || current.State.Run == nil {
+		return Result[ResumeOutcome, error]{Err: fmt.Errorf("resume for %s is not implemented", current.Operation.Intent.Kind)}, nil
+	}
+	if current.State.Run.Phase.Kind == PhaseAssistant && current.State.Run.Phase.Generation != nil && current.State.Run.Phase.Generation.Status != GenerationEffectPending {
+		if missing := l.missingIdentities(ctx, current.Configuration); missing != nil {
+			return Result[ResumeOutcome, error]{Err: missing}, nil
+		}
+	}
+	if err := l.harness.line(l.name).Do(ctx, func() error {
+		l.begin()
+		return nil
+	}); err != nil {
+		return Result[ResumeOutcome, error]{Err: err}, nil
+	}
+	outcome, err := l.harness.drive(ctx, l, current.Operation, current.State)
+	if err != nil {
+		return Result[ResumeOutcome, error]{Err: err}, nil
+	}
+	if outcome.Kind == "suspended" && outcome.Reason == "missing_identities" {
+		if missing := l.missingIdentities(ctx, current.Configuration); missing != nil {
+			return Result[ResumeOutcome, error]{Err: missing}, nil
+		}
+	}
+	return Ok[ResumeOutcome, error](ResumeOutcome{Operation: OperationRun, RunID: current.Operation.OperationID, Run: &outcome}), nil
+}
+
+func (l *runtimeLane) missingIdentities(ctx context.Context, config LaneConfiguration) *MissingIdentities {
+	missing := &MissingIdentities{TaggedError: TaggedError{Message: "required identity is unavailable"}, Lane: l.name}
+	if _, err := l.harness.models.Resolve(ctx, config.Model.Provider, config.Model.ModelID); err != nil {
+		missing.Models = []string{config.Model.Provider + "/" + config.Model.ModelID}
+	}
+	missing.Tools = missingActiveTools(l.harness.tools, config.ActiveToolNames)
+	if len(missing.Models) == 0 && len(missing.Tools) == 0 {
+		return nil
+	}
+	return missing
 }
 func (l *runtimeLane) Abort(context.Context) (Result[AbortOutcome, error], error) {
 	return Err[AbortOutcome](fmt.Errorf("abort is not implemented")), nil
@@ -1125,12 +1332,185 @@ func (h *Harness) SetStreamOptions(_ context.Context, options AgentHarnessStream
 	h.settings.UpdateStream(options)
 	return nil
 }
+
+func deferredHandle(message AgentMessage) (*DeferredHandle, bool) {
+	value := message.Content
+	if values, ok := message.Metadata["deferred"]; ok {
+		value = values
+	}
+	switch handle := value.(type) {
+	case DeferredHandle:
+		if handle.Provider != "" && handle.ModelID != "" && handle.ID != "" {
+			return &handle, true
+		}
+	case *DeferredHandle:
+		if handle != nil && handle.Provider != "" && handle.ModelID != "" && handle.ID != "" {
+			return cloneValue(*handle).(*DeferredHandle), true
+		}
+	case map[string]JSONValue:
+		provider, providerOK := handle["provider"].(string)
+		modelID, modelOK := handle["modelId"].(string)
+		id, idOK := handle["id"].(string)
+		if providerOK && modelOK && idOK && provider != "" && modelID != "" && id != "" {
+			return &DeferredHandle{Provider: provider, ModelID: modelID, ID: id, Data: handle["data"]}, true
+		}
+	}
+	return nil, false
+}
+
+func (h *Harness) settleGeneration(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation, generation Generation, message AgentMessage, phase RunPhase) (CurrentOperation, error) {
+	if generation.ResponseEntryID == "" || generation.UsageID == "" {
+		return CurrentOperation{}, fmt.Errorf("assistant settlement has no reserved ids")
+	}
+	usage := Usage{}
+	if message.Usage != nil {
+		usage = *message.Usage
+	}
+	entry := Entry{EntryBase: EntryBase{ID: generation.ResponseEntryID, ParentID: stringPointer(generation.Context.TriggerEntryID), Type: EntryMessage}, Message: messageCopy(message)}
+	var settlement SettlementResult
+	if err := h.effect(ctx, ActionInfo{Kind: "settlement", Description: "assistant response"}, func(ctx context.Context) error {
+		var err error
+		settlement, err = (&runtimeEffects{harness: h, lane: lane}).CommitEffectSettlement(ctx, current, EffectPlan{Kind: EffectAssistant, Key: EffectKey(operation.OperationID), Generation: &generation}, SettlementOutput{Kind: "assistant", Key: EffectKey(operation.OperationID), Message: &message, Phase: phase}, h.telemetry)
+		return err
+	}); err != nil {
+		return CurrentOperation{}, err
+	}
+	settled := settlement.Current
+	h.events.Emit(ctx, HarnessEvent{Type: string(EventEntryAdded), Lane: lane.name, Payload: cloneValue(entry)})
+	h.events.Emit(ctx, HarnessEvent{Type: string(EventUsage), Lane: lane.name, Payload: cloneValue(usage)})
+	h.events.Emit(ctx, HarnessEvent{Type: string(EventTurnEnd), Lane: lane.name, Payload: map[string]JSONValue{"runId": operation.OperationID, "turnId": generation.Context.StepID}})
+	return settled, nil
+}
+
+func retryDelay(policy NormalizedRetryPolicy, options AgentHarnessStreamOptions, attempt int64) int64 {
+	if policy.BaseDelayMs <= 0 {
+		return 0
+	}
+	delay := policy.BaseDelayMs
+	if delay > maxSafeInteger {
+		delay = maxSafeInteger
+	}
+	for i := int64(1); i < attempt; i++ {
+		if delay > maxSafeInteger/2 {
+			delay = maxSafeInteger
+			break
+		}
+		delay *= 2
+	}
+	maxDelay := options.MaxRetryDelayMs
+	if maxDelay > maxSafeInteger {
+		maxDelay = maxSafeInteger
+	}
+	if maxDelay > 0 && delay > maxDelay {
+		return maxDelay
+	}
+	return delay
+}
+
+func retryNotBefore(now, delay int64) int64 {
+	if delay > maxSafeInteger-now {
+		return maxSafeInteger
+	}
+	return now + delay
+}
+
+func (h *Harness) settleGenerationError(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation, generation Generation, cause error) (RunOutcome, error) {
+	return h.settleGenerationErrorMessage(ctx, lane, operation, current, generation, AgentMessage{}, cause)
+}
+
+func (h *Harness) settleGenerationErrorMessage(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation, generation Generation, message AgentMessage, cause error) (RunOutcome, error) {
+	if cause == nil {
+		cause = fmt.Errorf("generation failed")
+	}
+	if message.Role == "" && message.Content == nil && message.Usage == nil {
+		message = AgentMessage{Role: "assistant", Content: cause.Error()}
+	}
+	message.Role = "assistant"
+	message.StopReason = StopReasonError
+	next := RunPhase{Kind: PhaseFailureDrain, Error: &OperationError{Code: "runtime", Message: cause.Error()}, Provenance: &FailureProvenance{Kind: "assistant", EntryID: generation.ResponseEntryID}}
+	var terminal terminalGenerationError
+	if !errors.As(cause, &terminal) && generation.Attempt < generation.Context.RetryPolicy.MaxAttempts {
+		delay := retryDelay(generation.Context.RetryPolicy, generation.Context.StreamOptions, generation.Attempt)
+		next = RunPhase{Kind: PhaseAssistant, Generation: &Generation{Status: GenerationRetryWait, NextAttempt: generation.Attempt + 1, Context: generation.Context, NotBefore: retryNotBefore(time.Now().UnixMilli(), delay), ErrorMessage: cause.Error()}}
+	}
+	settled, err := h.settleGeneration(ctx, lane, operation, current, generation, message, next)
+	if err != nil {
+		return RunOutcome{}, err
+	}
+	if next.Kind == PhaseAssistant {
+		return h.drive(ctx, lane, operation, settled.State)
+	}
+	return h.finishFailure(ctx, lane, operation, settled, cause)
+}
+
+func (h *Harness) settleDeferred(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation, generation Generation, message AgentMessage, handle *DeferredHandle) (RunOutcome, error) {
+	next := RunPhase{Kind: PhaseDeferred, Deferred: &Deferred{Status: DeferredSuspended, StepID: generation.Context.StepID, SourceEntryID: generation.ResponseEntryID, Configuration: generation.Context.Configuration, StreamOptions: generation.Context.StreamOptions}}
+	settled, err := h.settleGeneration(ctx, lane, operation, current, generation, message, next)
+	if err != nil {
+		return RunOutcome{}, err
+	}
+	return RunOutcome{Kind: "suspended", RunID: operation.OperationID, LeafID: settled.LeafID, FinalEntryID: settled.LeafID, FinalMessage: &message, Reason: "deferred", Deferred: handle}, nil
+}
+
+func (h *Harness) settleAborted(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation, generation Generation, message AgentMessage) (RunOutcome, error) {
+	message.Role = "assistant"
+	message.StopReason = StopReasonAborted
+	phase := RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationMayFinish, IncludeFinalAssistant: true}, TriggerEntryID: generation.ResponseEntryID}}
+	settled, err := h.settleGeneration(ctx, lane, operation, current, generation, message, phase)
+	if err != nil {
+		return RunOutcome{}, err
+	}
+	result := RunOutcome{Kind: "aborted", RunID: operation.OperationID, LeafID: settled.LeafID, FinalEntryID: settled.LeafID, FinalMessage: &message, Reason: "cancelled"}
+	return h.finishOutcome(ctx, lane, operation, settled, result)
+}
+
+func (h *Harness) finishOutcome(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation, result RunOutcome) (RunOutcome, error) {
+	fx := &runtimeEffects{harness: h, lane: lane}
+	if err := h.effect(ctx, ActionInfo{Kind: "terminal", Description: "assistant terminal"}, func(ctx context.Context) error {
+		_, err := fx.CommitTerminal(ctx, current, result)
+		return err
+	}); err != nil {
+		return RunOutcome{}, err
+	}
+	h.events.Emit(ctx, HarnessEvent{Type: string(EventRunEnd), Lane: lane.name, Payload: cloneValue(result)})
+	return result, nil
+}
+
+func (h *Harness) finishFailure(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation, cause error) (RunOutcome, error) {
+	if cause == nil {
+		cause = fmt.Errorf("operation failed")
+	}
+	return h.finishFailureValue(ctx, lane, operation, current, &OperationError{Code: "runtime", Message: cause.Error()})
+}
+
+func (h *Harness) finishFailureValue(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation, errorValue *OperationError) (RunOutcome, error) {
+	if errorValue == nil {
+		errorValue = &OperationError{Code: "runtime", Message: "operation failed"}
+	}
+	result := RunOutcome{Kind: "failed", RunID: operation.OperationID, LeafID: current.LeafID, Error: errorValue}
+	if current.State.Run != nil {
+		result.FinalEntryID = current.State.Run.LatestAssistantEntryID
+		if result.FinalEntryID != nil {
+			if entry, err := lane.view.GetEntry(ctx, *result.FinalEntryID); err == nil && entry != nil && entry.Message != nil {
+				result.FinalMessage = messageCopy(*entry.Message)
+			}
+		}
+	}
+	return h.finishOutcome(ctx, lane, operation, current, result)
+}
 func (h *Harness) GetRetryPolicy(context.Context) (RetryPolicy, error) {
 	snapshot := h.settings.Snapshot()
 	return RetryPolicy{Enabled: snapshot.RetryPolicy.MaxAttempts > 1, MaxRetries: snapshot.RetryPolicy.MaxAttempts - 1, BaseDelayMs: snapshot.RetryPolicy.BaseDelayMs}, nil
 }
 func (h *Harness) SetRetryPolicy(_ context.Context, policy RetryPolicy) error {
-	h.settings.UpdateRetry(NormalizedRetryPolicy{MaxAttempts: policy.MaxRetries + 1, BaseDelayMs: policy.BaseDelayMs})
+	if policy.MaxRetries < 0 || policy.BaseDelayMs < 0 || policy.BaseDelayMs > maxSafeInteger || policy.MaxRetries > maxSafeInteger-1 {
+		return fmt.Errorf("retry policy exceeds safe limits")
+	}
+	maxAttempts := int64(1)
+	if policy.Enabled {
+		maxAttempts = policy.MaxRetries + 1
+	}
+	h.settings.UpdateRetry(NormalizedRetryPolicy{MaxAttempts: maxAttempts, BaseDelayMs: policy.BaseDelayMs})
 	return nil
 }
 func (h *Harness) GetCompactionSettings(context.Context) (CompactionSettings, error) {
