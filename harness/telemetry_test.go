@@ -66,6 +66,9 @@ func TestHarnessTelemetryUsesRequiredNamesAndSafeStorageAttributes(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := harness.Session().AppendMessage(ctx, AgentMessage{Role: "user", Content: "direct write"}); err != nil {
+		t.Fatal(err)
+	}
 	result, err := harness.Prompt(ctx, PromptInput{Text: "private prompt"})
 	if err != nil || !result.OK {
 		t.Fatalf("prompt = %v %+v", err, result)
