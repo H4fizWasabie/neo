@@ -79,6 +79,7 @@ type HookInvocation struct {
 	Lane  string    `json:"lane"`
 	RunID string    `json:"runId"`
 	Event JSONValue `json:"event,omitempty"`
+	Prior JSONValue `json:"-"`
 }
 
 type HookHandler func(context.Context, HookInvocation) (JSONValue, error)
