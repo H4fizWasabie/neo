@@ -660,6 +660,7 @@ type RuntimeLifecycle struct {
 	mu     sync.Mutex
 	closed bool
 	fault  error
+	done   chan struct{}
 }
 
 type IdentityResolver struct {
@@ -723,8 +724,27 @@ func (l *RuntimeLifecycle) Fault(err error) error {
 
 func (l *RuntimeLifecycle) Close() {
 	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return
+	}
 	l.closed = true
+	if l.done != nil {
+		close(l.done)
+	}
 	l.mu.Unlock()
+}
+
+func (l *RuntimeLifecycle) Done() <-chan struct{} {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.done == nil {
+		l.done = make(chan struct{})
+		if l.closed {
+			close(l.done)
+		}
+	}
+	return l.done
 }
 
 func (l *RuntimeLifecycle) Err() error {
