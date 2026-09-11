@@ -261,6 +261,7 @@ func (l *runtimeLane) Prompt(ctx context.Context, input PromptInput) (Result[Run
 	var acceptedState OperationState
 	acceptedInLine := false
 	begun := false
+	capturedNextRun := false
 	if err := l.harness.line(l.name).Do(ctx, func() error {
 		laneStateRegister, err := l.harness.session.GetRegister(ctx, RegisterLaneState, l.name)
 		if err != nil {
@@ -271,10 +272,16 @@ func (l *runtimeLane) Prompt(ctx context.Context, input PromptInput) (Result[Run
 		}
 		laneState, ok := laneStateRegister.Value.(LaneState)
 		if !ok || laneState.CurrentOperationID != nil {
-			return &LaneBusy{TaggedError: TaggedError{Message: "lane is busy"}, Lane: l.name}
+			busyID := ""
+			busyKind := OperationRun
+			if laneState.CurrentOperationID != nil {
+				busyID = *laneState.CurrentOperationID
+			}
+			return &LaneBusy{TaggedError: TaggedError{Message: "lane is busy"}, Lane: l.name, OperationID: busyID, OperationKind: busyKind}
 		}
 		l.begin()
 		begun = true
+		capturedNextRun = len(laneState.PendingNextRun) != 0
 		leafRegister, err := l.harness.session.GetRegister(ctx, RegisterLaneLeaf, l.name)
 		if err != nil {
 			return err
@@ -330,7 +337,9 @@ func (l *runtimeLane) Prompt(ctx context.Context, input PromptInput) (Result[Run
 			parent = &id
 		}
 		if len(promptIDs) == 0 {
-			return fmt.Errorf("prompt is empty")
+			if !capturedNextRun {
+				return fmt.Errorf("prompt is empty")
+			}
 		}
 		accepted = Operation{OperationID: operationID, Lane: l.name, SourceLeafID: cloneStringPointer(leaf), StartedAt: time.Now().UnixMilli(), Intent: OperationIntent{Kind: OperationRun, PromptEntryIDs: promptIDs, SystemPromptOverride: capturedSystemPrompt, ResumeData: resumeData}}
 		acceptedState = OperationState{Kind: OperationRun, Run: &RunState{Kind: OperationRun, Control: Control{Status: ControlRunning}, Settings: RunSettings{Compaction: l.harness.compaction, SteeringMode: l.harness.steeringMode, FollowUpMode: l.harness.followUpMode, ToolExecution: l.harness.toolExecution}, Phase: RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationNeedAssistant}, TriggerEntryID: *parent, SkipInboxOnce: true}}, Inbox: Inbox{}}}
@@ -656,15 +665,18 @@ func (e *runtimeEffects) CommitTransition(ctx context.Context, current CurrentOp
 		return nil, fmt.Errorf("transition has no operation")
 	}
 	if expectedConfigurationSeq != nil && *expectedConfigurationSeq != current.ConfigurationSeq {
-		return nil, nil
+		return nil, fmt.Errorf("stale lane configuration")
 	}
 	if expectedSettingsRevision != nil && *expectedSettingsRevision != e.harness.settings.Snapshot().SettingsRevision {
-		return nil, nil
+		return nil, fmt.Errorf("stale settings revision")
 	}
 	var commit CommitResult
 	if err := e.harness.line(e.lane.name).Do(ctx, func() error {
 		valid, err := e.current(ctx, current)
 		if err != nil || !valid {
+			if err == nil {
+				err = fmt.Errorf("stale operation state")
+			}
 			return err
 		}
 		commit, err = e.harness.session.Commit(ctx, Transaction{Writes: []Write{registerSet(RegisterOpState, current.Operation.OperationID, next)}})
@@ -698,6 +710,9 @@ func (e *runtimeEffects) CommitEffectSettlement(ctx context.Context, current Cur
 	if err := e.harness.line(e.lane.name).Do(ctx, func() error {
 		valid, err := e.current(ctx, current)
 		if err != nil || !valid {
+			if err == nil {
+				err = fmt.Errorf("stale operation state")
+			}
 			return err
 		}
 		commit, err := e.harness.session.Commit(ctx, Transaction{Writes: []Write{Write{Kind: WriteEntry, Entry: &EntryWrite{Entry: entry}}, Write{Kind: WriteUsage, Usage: &UsageWrite{Row: UsageRow{ID: usageID, Usage: usage, EntryID: &responseID}}}, registerSet(RegisterLaneLeaf, e.lane.name, stringPointer(responseID)), registerSet(RegisterOpState, current.Operation.OperationID, next)}})
@@ -735,6 +750,9 @@ func (e *runtimeEffects) CommitTerminal(ctx context.Context, current CurrentOper
 	if err := e.harness.line(e.lane.name).Do(ctx, func() error {
 		valid, err := e.current(ctx, current)
 		if err != nil || !valid {
+			if err == nil {
+				err = fmt.Errorf("stale operation state")
+			}
 			return err
 		}
 		_, err = e.harness.session.Commit(ctx, Transaction{Writes: writes})
@@ -810,6 +828,14 @@ func (h *Harness) failOperation(ctx context.Context, lane *runtimeLane, operatio
 	if cause == nil {
 		cause = fmt.Errorf("operation failed")
 	}
+	stateRegister, err := h.session.GetRegister(ctx, RegisterOpState, operation.OperationID)
+	if err != nil {
+		return RunOutcome{}, err
+	}
+	if stateRegister == nil {
+		return RunOutcome{}, fmt.Errorf("operation disappeared before failure settlement")
+	}
+	expectedStateSeq := stateRegister.Seq
 	errorValue := &OperationError{Code: "runtime", Message: cause.Error()}
 	var leaf *string
 	if current, err := lane.GetLeafID(ctx); err != nil {
@@ -849,7 +875,17 @@ func (h *Harness) failOperation(ctx context.Context, lane *runtimeLane, operatio
 	}
 	writes = append(writes, registerSet(RegisterLaneLastResult, lane.name, LaneLastResult{OperationID: operation.OperationID, Kind: OperationRun, Outcome: result.Kind, LeafID: result.LeafID, FinalAssistantEntryID: result.FinalEntryID, Error: errorValue}), registerSet(RegisterLaneState, lane.name, laneState))
 	if err := h.effect(ctx, ActionInfo{Kind: "terminal", Description: "failed operation"}, func(ctx context.Context) error {
-		return h.line(lane.name).Do(ctx, func() error { _, err := h.session.Commit(ctx, Transaction{Writes: writes}); return err })
+		return h.line(lane.name).Do(ctx, func() error {
+			current, err := h.session.GetRegister(ctx, RegisterOpState, operation.OperationID)
+			if err != nil {
+				return err
+			}
+			if current == nil || current.Seq != expectedStateSeq {
+				return fmt.Errorf("stale operation state")
+			}
+			_, err = h.session.Commit(ctx, Transaction{Writes: writes})
+			return err
+		})
 	}); err != nil {
 		return RunOutcome{}, err
 	}
