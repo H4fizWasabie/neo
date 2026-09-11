@@ -2,6 +2,12 @@ package harness
 
 import "context"
 
+type MessageSchema func(AgentMessage) error
+
+type SessionCodecOptions struct {
+	CustomMessageSchemas map[string]MessageSchema
+}
+
 type SessionMetadata struct {
 	ID                      string `json:"id"`
 	CreatedAt               int64  `json:"createdAt"`
@@ -63,6 +69,7 @@ type SessionTree interface {
 	SetLabel(context.Context, string, *string) error
 	GetCustomFact(context.Context, string) (JSONValue, error)
 	SetCustomFact(context.Context, string, JSONValue) error
+	DeleteCustomFact(context.Context, string) error
 	FindEntries(context.Context, EntryQuery) ([]Entry, error)
 	FindEntry(context.Context, EntryQuery) (*Entry, error)
 	FindEntriesOnBranch(context.Context, BranchScan) ([]Entry, error)
