@@ -23,6 +23,7 @@ type Harness struct {
 	steeringMode       QueueMode
 	followUpMode       QueueMode
 	toolExecution      ToolExecutionMode
+	configurationMu    sync.RWMutex
 	lines              sync.Map
 	scheduler          *ManualScheduler
 	hooks              *HookRunner
@@ -56,6 +57,24 @@ func NewHarness(ctx context.Context, options AgentHarnessOptions) (*Harness, []S
 	}
 	if options.ToolExecution == "" {
 		options.ToolExecution = ToolExecutionParallel
+	}
+	if options.SteeringMode == "" {
+		options.SteeringMode = QueueAll
+	}
+	if options.FollowUpMode == "" {
+		options.FollowUpMode = QueueAll
+	}
+	if err := validateCompactionSettings(options.Compaction); err != nil {
+		return nil, nil, err
+	}
+	if err := validateQueueMode(options.SteeringMode); err != nil {
+		return nil, nil, err
+	}
+	if err := validateQueueMode(options.FollowUpMode); err != nil {
+		return nil, nil, err
+	}
+	if options.ToolExecution != ToolExecutionSequential && options.ToolExecution != ToolExecutionParallel {
+		return nil, nil, fmt.Errorf("invalid tool execution mode %q", options.ToolExecution)
 	}
 	if options.ThinkingLevel == "" {
 		options.ThinkingLevel = ThinkingOff
@@ -186,10 +205,76 @@ func (h *Harness) Close(ctx context.Context) error {
 }
 
 func (h *Harness) Name() string         { return h.runtimeLane.name }
-func (h *Harness) Session() SessionTree { return h.runtimeLane.view }
+func (h *Harness) Session() SessionTree { return h.runtimeLane.Session() }
 
 func (l *runtimeLane) Name() string         { return l.name }
-func (l *runtimeLane) Session() SessionTree { return l.view }
+func (l *runtimeLane) Session() SessionTree { return &laneTree{SessionTree: l.view, lane: l} }
+
+type laneTree struct {
+	SessionTree
+	lane *runtimeLane
+}
+
+func (t *laneTree) AppendMessage(ctx context.Context, message AgentMessage) (string, error) {
+	deferred, err := t.lane.hasActiveOperation(ctx)
+	if err != nil {
+		return "", err
+	}
+	if deferred {
+		return t.lane.enqueueTreeEntry(ctx, PendingEntry{Type: EntryMessage, Payload: message})
+	}
+	return t.SessionTree.AppendMessage(ctx, message)
+}
+
+func (t *laneTree) AppendCustomEntry(ctx context.Context, customType string, data JSONValue) (string, error) {
+	deferred, err := t.lane.hasActiveOperation(ctx)
+	if err != nil {
+		return "", err
+	}
+	if deferred {
+		return t.lane.enqueueTreeEntry(ctx, PendingEntry{Type: EntryCustom, CustomType: customType, Payload: data})
+	}
+	return t.SessionTree.AppendCustomEntry(ctx, customType, data)
+}
+
+func (l *runtimeLane) hasActiveOperation(ctx context.Context) (bool, error) {
+	register, err := l.harness.session.GetRegister(ctx, RegisterLaneState, l.name)
+	if err != nil {
+		return false, err
+	}
+	if register == nil {
+		return false, fmt.Errorf("lane state is missing")
+	}
+	state, ok := register.Value.(LaneState)
+	if !ok {
+		return false, fmt.Errorf("lane state has invalid type")
+	}
+	return state.CurrentOperationID != nil, nil
+}
+
+func (l *runtimeLane) enqueueTreeEntry(ctx context.Context, pending PendingEntry) (string, error) {
+	id := l.harness.session.IDGenerator().Next()
+	operationID := ""
+	err := l.harness.line(l.name).Do(ctx, func() error {
+		current, err := l.harness.currentOperation(ctx, l)
+		if err != nil {
+			return err
+		}
+		state := current.State
+		if state.Run == nil {
+			return &NoActiveRun{TaggedError: TaggedError{Message: "no active run"}, Lane: l.name}
+		}
+		operationID = current.Operation.OperationID
+		state.Run.Inbox.Writes = append(state.Run.Inbox.Writes, id)
+		_, err = l.harness.session.Commit(ctx, Transaction{Writes: []Write{registerSet(RegisterPendingEntry, id, pending), registerSet(RegisterOpState, current.Operation.OperationID, state)}})
+		return err
+	})
+	if err != nil {
+		return "", err
+	}
+	l.harness.events.Emit(ctx, HarnessEvent{Type: string(EventWritePending), Lane: l.name, Payload: map[string]JSONValue{"runId": operationID, "entryId": id, "entryType": pending.Type}})
+	return id, nil
+}
 
 func (l *runtimeLane) GetLeafID(ctx context.Context) (*string, error) { return l.view.GetLeafID(ctx) }
 
@@ -355,7 +440,8 @@ func (l *runtimeLane) Prompt(ctx context.Context, input PromptInput) (Result[Run
 			}
 		}
 		accepted = Operation{OperationID: operationID, Lane: l.name, SourceLeafID: cloneStringPointer(leaf), StartedAt: time.Now().UnixMilli(), Intent: OperationIntent{Kind: OperationRun, PromptEntryIDs: promptIDs, SystemPromptOverride: capturedSystemPrompt, ResumeData: resumeData}}
-		acceptedState = OperationState{Kind: OperationRun, Run: &RunState{Kind: OperationRun, Control: Control{Status: ControlRunning}, Settings: RunSettings{Compaction: l.harness.compaction, SteeringMode: l.harness.steeringMode, FollowUpMode: l.harness.followUpMode, ToolExecution: l.harness.toolExecution}, Phase: RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationNeedAssistant}, TriggerEntryID: *parent, SkipInboxOnce: true}}, Inbox: Inbox{}}}
+		runSettings := l.harness.runSettings()
+		acceptedState = OperationState{Kind: OperationRun, Run: &RunState{Kind: OperationRun, Control: Control{Status: ControlRunning}, Settings: runSettings, Phase: RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationNeedAssistant}, TriggerEntryID: *parent, SkipInboxOnce: true}}, Inbox: Inbox{}}}
 		laneState.CurrentOperationID = &operationID
 		laneState.PendingNextRun = []string{}
 		writes = append(writes, registerSet(RegisterOpMeta, operationID, accepted), registerSet(RegisterOpState, operationID, acceptedState), registerSet(RegisterLaneLeaf, l.name, parent), registerSet(RegisterLaneState, l.name, laneState))
@@ -524,6 +610,17 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 		if phase.Kind == PhaseCheckpoint {
 			if phase.Checkpoint == nil {
 				return h.finishFailure(ctx, lane, operation, current, fmt.Errorf("checkpoint has no payload"))
+			}
+			if !phase.Checkpoint.SkipInboxOnce {
+				consumed, next, err := h.consumeCheckpointInput(ctx, lane, current)
+				if err != nil {
+					return RunOutcome{}, err
+				}
+				if consumed {
+					current = next
+					state = next.State
+					continue
+				}
 			}
 			if phase.Checkpoint.Continuation.Kind == ContinuationMayFinish {
 				if !phase.Checkpoint.Continuation.IncludeFinalAssistant {
@@ -699,12 +796,11 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 		if message.StopReason == StopReasonToolUse {
 			return h.settleGenerationError(ctx, lane, operation, current, *pending.Run.Phase.Generation, terminalGenerationError{fmt.Errorf("tool_use response has no tool calls")})
 		}
-		result := RunOutcome{Kind: "completed", RunID: operation.OperationID, LeafID: stringPointer(pending.Run.Phase.Generation.ResponseEntryID), FinalEntryID: stringPointer(pending.Run.Phase.Generation.ResponseEntryID), FinalMessage: &message}
 		settled, err := h.settleGeneration(ctx, lane, operation, current, *pending.Run.Phase.Generation, message, RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationMayFinish, IncludeFinalAssistant: true}, TriggerEntryID: pending.Run.Phase.Generation.ResponseEntryID}})
 		if err != nil {
 			return RunOutcome{}, err
 		}
-		return h.finishOutcome(ctx, lane, operation, settled, result)
+		return h.drive(ctx, lane, operation, settled.State)
 	}
 }
 
@@ -718,6 +814,134 @@ func (h *Harness) runBeforeRequest(ctx context.Context, fx *runtimeEffects, oper
 		}
 		return err
 	})
+}
+
+func (h *Harness) consumeCheckpointInput(ctx context.Context, lane *runtimeLane, current CurrentOperation) (bool, CurrentOperation, error) {
+	if current.State.Run == nil || current.State.Run.Phase.Checkpoint == nil {
+		return false, current, nil
+	}
+	run := current.State.Run
+	ids := append([]string(nil), run.Inbox.Writes...)
+	queue := "writes"
+	project := false
+	if len(ids) == 0 {
+		if len(run.Inbox.Steer) != 0 {
+			ids = queueIDs(run.Inbox.Steer, run.Settings.SteeringMode)
+			queue = "steer"
+			project = true
+		} else if run.Phase.Checkpoint.Continuation.Kind == ContinuationMayFinish {
+			if len(run.Inbox.FollowUp) == 0 {
+				return false, current, nil
+			}
+			ids = queueIDs(run.Inbox.FollowUp, run.Settings.FollowUpMode)
+			queue = "followUp"
+			project = true
+		} else {
+			return false, current, nil
+		}
+	}
+	parent := current.LeafID
+	entries := make([]Write, 0, len(ids)*2+3)
+	applied := make([]Entry, 0, len(ids))
+	for _, id := range ids {
+		register, err := h.session.GetRegister(ctx, RegisterPendingEntry, id)
+		if err != nil {
+			return false, current, err
+		}
+		if register == nil {
+			return false, current, fmt.Errorf("queued item %s has no payload register", id)
+		}
+		pending, ok := register.Value.(PendingEntry)
+		if !ok {
+			return false, current, fmt.Errorf("queued item %s has invalid payload", id)
+		}
+		entry := Entry{EntryBase: EntryBase{ID: id, ParentID: cloneStringPointer(parent), Type: pending.Type}, CustomType: pending.CustomType, Data: cloneValue(pending.Payload)}
+		if pending.Type == EntryMessage {
+			message, ok := pending.Payload.(AgentMessage)
+			if !ok {
+				return false, current, fmt.Errorf("queued message %s has invalid payload", id)
+			}
+			entry.Message = messageCopy(message)
+			entry.Data = nil
+			project = true
+		}
+		entries = append(entries, Write{Kind: WriteEntry, Entry: &EntryWrite{Entry: entry}}, registerDelete(RegisterPendingEntry, id))
+		applied = append(applied, entry)
+		parent = &id
+	}
+	next := current.State
+	switch queue {
+	case "writes":
+		next.Run.Inbox.Writes = removeIDs(next.Run.Inbox.Writes, ids)
+	case "steer":
+		next.Run.Inbox.Steer = removeIDs(next.Run.Inbox.Steer, ids)
+	case "followUp":
+		next.Run.Inbox.FollowUp = removeIDs(next.Run.Inbox.FollowUp, ids)
+	}
+	continuation := next.Run.Phase.Checkpoint.Continuation
+	if project {
+		continuation = Continuation{Kind: ContinuationNeedAssistant}
+	}
+	next.Run.Phase = RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: continuation, TriggerEntryID: stringValue(parent), SkipInboxOnce: project}}
+	if err := h.effect(ctx, ActionInfo{Kind: "transition", Description: "consume queued input"}, func(ctx context.Context) error {
+		return h.line(lane.name).Do(ctx, func() error {
+			valid, err := (&runtimeEffects{harness: h, lane: lane}).current(ctx, current)
+			if err != nil || !valid {
+				if err == nil {
+					err = fmt.Errorf("stale operation state")
+				}
+				return err
+			}
+			latestLane, err := h.session.GetRegister(ctx, RegisterLaneState, lane.name)
+			if err != nil || latestLane == nil {
+				return err
+			}
+			laneState, ok := latestLane.Value.(LaneState)
+			if !ok {
+				return fmt.Errorf("lane state has invalid type")
+			}
+			writes := append(entries, registerSet(RegisterLaneLeaf, lane.name, cloneStringPointer(parent)), registerSet(RegisterLaneState, lane.name, laneState), registerSet(RegisterOpState, current.Operation.OperationID, next))
+			_, err = h.session.Commit(ctx, Transaction{Writes: writes})
+			return err
+		})
+	}); err != nil {
+		return false, current, err
+	}
+	current.State = next
+	current.LeafID = cloneStringPointer(parent)
+	for _, entry := range applied {
+		h.events.Emit(ctx, HarnessEvent{Type: string(EventEntryAdded), Lane: lane.name, Payload: cloneValue(entry)})
+	}
+	h.eventsQueueUpdate(ctx, lane)
+	return true, current, nil
+}
+
+func queueIDs(ids []string, mode QueueMode) []string {
+	if mode == QueueOneAtATime && len(ids) > 1 {
+		return append([]string(nil), ids[:1]...)
+	}
+	return append([]string(nil), ids...)
+}
+
+func removeIDs(ids, remove []string) []string {
+	set := make(map[string]struct{}, len(remove))
+	for _, id := range remove {
+		set[id] = struct{}{}
+	}
+	result := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := set[id]; !ok {
+			result = append(result, id)
+		}
+	}
+	return result
+}
+
+func stringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 func (h *Harness) driveTools(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation) (RunOutcome, error) {
@@ -1734,17 +1958,83 @@ func (l *runtimeLane) missingIdentities(ctx context.Context, config LaneConfigur
 func (l *runtimeLane) Abort(context.Context) (Result[AbortOutcome, error], error) {
 	return Err[AbortOutcome](fmt.Errorf("abort is not implemented")), nil
 }
-func (l *runtimeLane) Steer(context.Context, PromptInput) (Result[QueueOutcome, error], error) {
-	return Err[QueueOutcome](fmt.Errorf("steer is not implemented")), nil
+func (l *runtimeLane) Steer(ctx context.Context, input PromptInput) (Result[QueueOutcome, error], error) {
+	return l.enqueueQueue(ctx, input, false)
 }
-func (l *runtimeLane) FollowUp(context.Context, PromptInput) (Result[QueueOutcome, error], error) {
-	return Err[QueueOutcome](fmt.Errorf("follow-up is not implemented")), nil
+func (l *runtimeLane) FollowUp(ctx context.Context, input PromptInput) (Result[QueueOutcome, error], error) {
+	return l.enqueueQueue(ctx, input, true)
 }
-func (l *runtimeLane) NextRun(context.Context, PromptInput) (Result[NextRunOutcome, error], error) {
-	return Err[NextRunOutcome](fmt.Errorf("next-run is not implemented")), nil
+func (l *runtimeLane) NextRun(ctx context.Context, input PromptInput) (Result[NextRunOutcome, error], error) {
+	message, err := queueMessage(input)
+	if err != nil {
+		return Result[NextRunOutcome, error]{Err: err}, nil
+	}
+	id := l.harness.session.IDGenerator().Next()
+	if err := l.harness.line(l.name).Do(ctx, func() error {
+		register, err := l.harness.session.GetRegister(ctx, RegisterLaneState, l.name)
+		if err != nil {
+			return err
+		}
+		if register == nil {
+			return fmt.Errorf("lane state is missing")
+		}
+		state, ok := register.Value.(LaneState)
+		if !ok {
+			return fmt.Errorf("lane state has invalid type")
+		}
+		state.PendingNextRun = append(state.PendingNextRun, id)
+		_, err = l.harness.session.Commit(ctx, Transaction{Writes: []Write{registerSet(RegisterPendingEntry, id, PendingEntry{Type: EntryMessage, Payload: message}), registerSet(RegisterLaneState, l.name, state)}})
+		return err
+	}); err != nil {
+		return Result[NextRunOutcome, error]{Err: err}, nil
+	}
+	l.harness.eventsQueueUpdate(ctx, l)
+	return Ok[NextRunOutcome, error](NextRunOutcome{EntryID: id}), nil
 }
-func (l *runtimeLane) CancelQueued(context.Context, string) (Result[CancelQueuedOutcome, error], error) {
-	return Err[CancelQueuedOutcome](fmt.Errorf("queue cancellation is not implemented")), nil
+func (l *runtimeLane) CancelQueued(ctx context.Context, id string) (Result[CancelQueuedOutcome, error], error) {
+	if id == "" {
+		return Ok[CancelQueuedOutcome, error](CancelQueuedOutcome{Kind: "not_found"}), nil
+	}
+	var outcome CancelQueuedOutcome
+	if err := l.harness.line(l.name).Do(ctx, func() error {
+		laneRegister, err := l.harness.session.GetRegister(ctx, RegisterLaneState, l.name)
+		if err != nil || laneRegister == nil {
+			return err
+		}
+		laneState, ok := laneRegister.Value.(LaneState)
+		if !ok {
+			return fmt.Errorf("lane state has invalid type")
+		}
+		if removeID(&laneState.PendingNextRun, id) {
+			outcome.Kind = "cancelled"
+			_, err = l.harness.session.Commit(ctx, Transaction{Writes: []Write{registerDelete(RegisterPendingEntry, id), registerSet(RegisterLaneState, l.name, laneState)}})
+			return err
+		}
+		operation, operationErr := l.harness.currentOperation(ctx, l)
+		if operationErr == nil && operation.State.Run != nil {
+			for _, queue := range []*[]string{&operation.State.Run.Inbox.Steer, &operation.State.Run.Inbox.FollowUp, &operation.State.Run.Inbox.Writes} {
+				if removeID(queue, id) {
+					_, err = l.harness.session.Commit(ctx, Transaction{Writes: []Write{registerDelete(RegisterPendingEntry, id), registerSet(RegisterOpState, operation.Operation.OperationID, operation.State)}})
+					outcome.Kind = "cancelled"
+					return err
+				}
+			}
+		}
+		entries, err := l.harness.session.GetEntries(ctx, []string{id})
+		if err != nil {
+			return err
+		}
+		if _, ok := entries[id]; ok {
+			outcome.Kind = "already_consumed"
+		} else {
+			outcome.Kind = "not_found"
+		}
+		return nil
+	}); err != nil {
+		return Result[CancelQueuedOutcome, error]{Err: err}, nil
+	}
+	l.harness.eventsQueueUpdate(ctx, l)
+	return Ok[CancelQueuedOutcome, error](outcome), nil
 }
 func (l *runtimeLane) RecordUsage(context.Context, Usage, *string, JSONValue) (Result[RecordUsageOutcome, error], error) {
 	return Err[RecordUsageOutcome](fmt.Errorf("usage recording is not implemented")), nil
@@ -2072,6 +2362,138 @@ func (h *Harness) finishFailureValue(ctx context.Context, lane *runtimeLane, ope
 	}
 	return h.finishOutcome(ctx, lane, operation, current, result)
 }
+
+func queueMessage(input PromptInput) (AgentMessage, error) {
+	if len(input.Messages) > 1 || input.Text != "" && len(input.Messages) != 0 {
+		return AgentMessage{}, fmt.Errorf("queued input must contain one message")
+	}
+	if len(input.Messages) == 1 {
+		return *messageCopy(input.Messages[0]), nil
+	}
+	if input.Text == "" && len(input.Images) == 0 {
+		return AgentMessage{}, fmt.Errorf("queued input is empty")
+	}
+	var content JSONValue = input.Text
+	if len(input.Images) != 0 {
+		content = append([]ImageContent(nil), input.Images...)
+		if input.Text != "" {
+			content = map[string]JSONValue{"text": input.Text, "images": append([]ImageContent(nil), input.Images...)}
+		}
+	}
+	return AgentMessage{Role: "user", Content: content}, nil
+}
+
+func (l *runtimeLane) enqueueQueue(ctx context.Context, input PromptInput, followUp bool) (Result[QueueOutcome, error], error) {
+	message, err := queueMessage(input)
+	if err != nil {
+		return Result[QueueOutcome, error]{Err: err}, nil
+	}
+	id := l.harness.session.IDGenerator().Next()
+	if err := l.harness.line(l.name).Do(ctx, func() error {
+		current, err := l.harness.currentOperation(ctx, l)
+		if err != nil {
+			return &NoActiveRun{TaggedError: TaggedError{Message: "no active run"}, Lane: l.name}
+		}
+		if current.State.Run == nil || current.State.Run.Control.Status != ControlRunning {
+			return &NoActiveRun{TaggedError: TaggedError{Message: "run is not accepting queued input"}, Lane: l.name}
+		}
+		state := current.State
+		if followUp {
+			state.Run.Inbox.FollowUp = append(state.Run.Inbox.FollowUp, id)
+		} else {
+			state.Run.Inbox.Steer = append(state.Run.Inbox.Steer, id)
+		}
+		_, err = l.harness.session.Commit(ctx, Transaction{Writes: []Write{registerSet(RegisterPendingEntry, id, PendingEntry{Type: EntryMessage, Payload: message}), registerSet(RegisterOpState, current.Operation.OperationID, state)}})
+		return err
+	}); err != nil {
+		return Result[QueueOutcome, error]{Err: err}, nil
+	}
+	l.harness.eventsQueueUpdate(ctx, l)
+	return Ok[QueueOutcome, error](QueueOutcome{EntryID: id}), nil
+}
+
+func (h *Harness) eventsQueueUpdate(ctx context.Context, lane *runtimeLane) {
+	snapshot, err := h.queueSnapshot(ctx, lane)
+	if err != nil {
+		return
+	}
+	h.events.Emit(ctx, HarnessEvent{Type: string(EventQueueUpdate), Lane: lane.name, Payload: snapshot})
+}
+
+func (h *Harness) queueSnapshot(ctx context.Context, lane *runtimeLane) (QueueSnapshot, error) {
+	restored, err := Restore(ctx, h.session, lane.name)
+	if err != nil {
+		return QueueSnapshot{}, err
+	}
+	steer, followUp := []string(nil), []string(nil)
+	if restored.Current != nil && restored.Current.State.Run != nil {
+		steer = restored.Current.State.Run.Inbox.Steer
+		followUp = restored.Current.State.Run.Inbox.FollowUp
+	}
+	stateRegister, err := h.session.GetRegister(ctx, RegisterLaneState, lane.name)
+	if err != nil {
+		return QueueSnapshot{}, err
+	}
+	if stateRegister == nil {
+		return QueueSnapshot{}, fmt.Errorf("lane state is missing")
+	}
+	state, ok := stateRegister.Value.(LaneState)
+	if !ok {
+		return QueueSnapshot{}, fmt.Errorf("lane state has invalid type")
+	}
+	item := func(id string) (QueueItem, error) {
+		register, err := h.session.GetRegister(ctx, RegisterPendingEntry, id)
+		if err != nil {
+			return QueueItem{}, err
+		}
+		if register == nil {
+			return QueueItem{}, fmt.Errorf("queued item %s has no payload register", id)
+		}
+		pending, ok := register.Value.(PendingEntry)
+		if !ok || pending.Type != EntryMessage {
+			return QueueItem{}, fmt.Errorf("queued item %s is not a message", id)
+		}
+		message, ok := pending.Payload.(AgentMessage)
+		if !ok {
+			return QueueItem{}, fmt.Errorf("queued item %s has invalid message", id)
+		}
+		return QueueItem{EntryID: id, Message: *messageCopy(message)}, nil
+	}
+	items := func(ids []string) ([]QueueItem, error) {
+		result := make([]QueueItem, 0, len(ids))
+		for _, id := range ids {
+			queued, err := item(id)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, queued)
+		}
+		return result, nil
+	}
+	steerItems, err := items(steer)
+	if err != nil {
+		return QueueSnapshot{}, err
+	}
+	followUpItems, err := items(followUp)
+	if err != nil {
+		return QueueSnapshot{}, err
+	}
+	nextRunItems, err := items(state.PendingNextRun)
+	if err != nil {
+		return QueueSnapshot{}, err
+	}
+	return QueueSnapshot{Steer: steerItems, FollowUp: followUpItems, NextRun: nextRunItems}, nil
+}
+
+func removeID(ids *[]string, wanted string) bool {
+	for i, id := range *ids {
+		if id == wanted {
+			*ids = append((*ids)[:i], (*ids)[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
 func (h *Harness) GetRetryPolicy(context.Context) (RetryPolicy, error) {
 	snapshot := h.settings.Snapshot()
 	return RetryPolicy{Enabled: snapshot.RetryPolicy.MaxAttempts > 1, MaxRetries: snapshot.RetryPolicy.MaxAttempts - 1, BaseDelayMs: snapshot.RetryPolicy.BaseDelayMs}, nil
@@ -2088,15 +2510,67 @@ func (h *Harness) SetRetryPolicy(_ context.Context, policy RetryPolicy) error {
 	return nil
 }
 func (h *Harness) GetCompactionSettings(context.Context) (CompactionSettings, error) {
-	return CompactionSettings{}, nil
+	h.configurationMu.RLock()
+	defer h.configurationMu.RUnlock()
+	return h.compaction, nil
 }
-func (h *Harness) SetCompactionSettings(context.Context, CompactionSettings) error {
-	return fmt.Errorf("compaction settings are not implemented")
+func (h *Harness) SetCompactionSettings(_ context.Context, settings CompactionSettings) error {
+	if err := validateCompactionSettings(settings); err != nil {
+		return err
+	}
+	h.configurationMu.Lock()
+	h.compaction = settings
+	h.configurationMu.Unlock()
+	return nil
 }
-func (h *Harness) GetSteeringMode(context.Context) (QueueMode, error) { return QueueAll, nil }
-func (h *Harness) SetSteeringMode(context.Context, QueueMode) error   { return nil }
-func (h *Harness) GetFollowUpMode(context.Context) (QueueMode, error) { return QueueAll, nil }
-func (h *Harness) SetFollowUpMode(context.Context, QueueMode) error   { return nil }
+func (h *Harness) GetSteeringMode(context.Context) (QueueMode, error) {
+	h.configurationMu.RLock()
+	defer h.configurationMu.RUnlock()
+	return h.steeringMode, nil
+}
+func (h *Harness) SetSteeringMode(_ context.Context, mode QueueMode) error {
+	if err := validateQueueMode(mode); err != nil {
+		return err
+	}
+	h.configurationMu.Lock()
+	h.steeringMode = mode
+	h.configurationMu.Unlock()
+	return nil
+}
+func (h *Harness) GetFollowUpMode(context.Context) (QueueMode, error) {
+	h.configurationMu.RLock()
+	defer h.configurationMu.RUnlock()
+	return h.followUpMode, nil
+}
+func (h *Harness) SetFollowUpMode(_ context.Context, mode QueueMode) error {
+	if err := validateQueueMode(mode); err != nil {
+		return err
+	}
+	h.configurationMu.Lock()
+	h.followUpMode = mode
+	h.configurationMu.Unlock()
+	return nil
+}
+
+func (h *Harness) runSettings() RunSettings {
+	h.configurationMu.RLock()
+	defer h.configurationMu.RUnlock()
+	return RunSettings{Compaction: h.compaction, SteeringMode: h.steeringMode, FollowUpMode: h.followUpMode, ToolExecution: h.toolExecution}
+}
+
+func validateCompactionSettings(settings CompactionSettings) error {
+	if settings.ReserveTokens < 0 || settings.ReserveTokens > maxSafeInteger || settings.KeepRecentTokens < 0 || settings.KeepRecentTokens > maxSafeInteger {
+		return fmt.Errorf("compaction token settings exceed safe limits")
+	}
+	return nil
+}
+
+func validateQueueMode(mode QueueMode) error {
+	if mode != QueueAll && mode != QueueOneAtATime {
+		return fmt.Errorf("invalid queue mode %q", mode)
+	}
+	return nil
+}
 func (h *Harness) WatchSession(context.Context) (WatchHandle[SessionSnapshot], error) {
 	return WatchHandle[SessionSnapshot]{Snapshot: SessionSnapshot{}, Start: func(_ func(HarnessEvent)) {}, Unsubscribe: func() {}}, nil
 }
