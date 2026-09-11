@@ -87,7 +87,7 @@ func TestHarnessRunsNoToolPromptAndCleansUpTerminalState(t *testing.T) {
 	mu.Lock()
 	gotEvents := append([]string(nil), events...)
 	mu.Unlock()
-	want := []string{string(EventMessageStart), string(EventMessageUpdate), string(EventMessageEnd), string(EventEntryAdded), string(EventUsage)}
+	want := []string{string(EventRunStart), string(EventTurnStart), string(EventMessageStart), string(EventMessageUpdate), string(EventMessageEnd), string(EventEntryAdded), string(EventUsage), string(EventTurnEnd), string(EventRunEnd)}
 	if len(gotEvents) != len(want) {
 		t.Fatalf("event count = %v, want %v", gotEvents, want)
 	}

@@ -86,6 +86,7 @@ func (e *HarnessClosed) Error() string { return e.Message }
 
 type RunOutcome struct {
 	Kind         string          `json:"kind"`
+	RunID        string          `json:"runId,omitempty"`
 	LeafID       *string         `json:"leafId,omitempty"`
 	FinalEntryID *string         `json:"finalEntryId,omitempty"`
 	FinalMessage *AgentMessage   `json:"finalMessage,omitempty"`
