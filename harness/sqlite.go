@@ -303,25 +303,6 @@ func (s *SQLiteStorage) Commit(ctx context.Context, tx Transaction) (CommitResul
 func (s *SQLiteStorage) applySQL(ctx context.Context, conn *sql.Conn, tx Transaction, result CommitResult) error {
 	messageDelta := int64(0)
 	var usageDelta SessionStats
-	previousLeaves := make(map[string]*string)
-	for _, write := range tx.Writes {
-		if write.Kind != WriteRegister || write.Register.Operation != RegisterSet || write.Register.Namespace != RegisterLaneLeaf {
-			continue
-		}
-		var value string
-		err := conn.QueryRowContext(ctx, `SELECT value FROM registers WHERE namespace = ? AND key = ?`, RegisterLaneLeaf, write.Register.Key).Scan(&value)
-		if err == sql.ErrNoRows {
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		var leaf *string
-		if err := json.Unmarshal([]byte(value), &leaf); err != nil {
-			return err
-		}
-		previousLeaves[write.Register.Key] = leaf
-	}
 	for i, write := range tx.Writes {
 		seq := result.Seqs[i]
 		switch write.Kind {
@@ -375,10 +356,16 @@ func (s *SQLiteStorage) applySQL(ctx context.Context, conn *sql.Conn, tx Transac
 			return err
 		}
 	}
-	return s.rebuildBranches(ctx, conn, tx, previousLeaves)
+	return s.rebuildBranches(ctx, conn, tx)
 }
 
-func (s *SQLiteStorage) rebuildBranches(ctx context.Context, conn *sql.Conn, tx Transaction, previousLeaves map[string]*string) error {
+func (s *SQLiteStorage) rebuildBranches(ctx context.Context, conn *sql.Conn, tx Transaction) error {
+	newEntries := make(map[string]struct{})
+	for _, write := range tx.Writes {
+		if write.Kind == WriteEntry {
+			newEntries[write.Entry.Entry.ID] = struct{}{}
+		}
+	}
 	for _, write := range tx.Writes {
 		if write.Kind != WriteRegister || write.Register.Operation != RegisterSet || write.Register.Namespace != RegisterLaneLeaf {
 			continue
@@ -395,29 +382,53 @@ func (s *SQLiteStorage) rebuildBranches(ctx context.Context, conn *sql.Conn, tx 
 		if err != sql.ErrNoRows {
 			return err
 		}
-		previous := previousLeaves[write.Register.Key]
-		if previous != nil {
-			var parent *string
-			var seq int64
-			if err := conn.QueryRowContext(ctx, `SELECT parent_id, seq FROM entries WHERE id = ?`, *leaf).Scan(&parent, &seq); err != nil {
+		var cached int
+		if err := conn.QueryRowContext(ctx, `SELECT 1 FROM branch_entries WHERE entry_id = ? LIMIT 1`, *leaf).Scan(&cached); err == nil {
+			continue
+		} else if err != sql.ErrNoRows {
+			return err
+		}
+		var parent *string
+		var seq int64
+		if err := conn.QueryRowContext(ctx, `SELECT parent_id, seq FROM entries WHERE id = ?`, *leaf).Scan(&parent, &seq); err != nil {
+			return err
+		}
+		if parent == nil {
+			if err := insertFullBranch(ctx, conn, *leaf); err != nil {
 				return err
 			}
-			if parent != nil && *parent == *previous {
-				var baseSeq int64
-				if err := conn.QueryRowContext(ctx, `SELECT seq FROM entries WHERE id = ?`, *previous).Scan(&baseSeq); err != nil {
-					return err
-				}
-				if err := insertBranchSegment(ctx, conn, *leaf, *leaf, seq, previous, baseSeq); err != nil {
+			continue
+		}
+		baseBranch, baseSeq, err := branchContainingEntry(ctx, conn, *parent)
+		if err != nil {
+			if _, inserted := newEntries[*parent]; inserted {
+				if err := insertFullBranch(ctx, conn, *leaf); err != nil {
 					return err
 				}
 				continue
 			}
+			return err
 		}
-		if err := insertFullBranch(ctx, conn, *leaf); err != nil {
+		if err := insertBranchSegment(ctx, conn, *leaf, *leaf, seq, &baseBranch, baseSeq); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func branchContainingEntry(ctx context.Context, conn *sql.Conn, entryID string) (string, int64, error) {
+	var branchID string
+	if err := conn.QueryRowContext(ctx, `SELECT branch_id FROM branch_entries WHERE entry_id = ? LIMIT 1`, entryID).Scan(&branchID); err != nil {
+		if err == sql.ErrNoRows {
+			return "", 0, sessionError(SessionInvalidEntry, fmt.Errorf("branch cache has no branch containing parent entry %s", entryID))
+		}
+		return "", 0, err
+	}
+	var seq int64
+	if err := conn.QueryRowContext(ctx, `SELECT seq FROM entries WHERE id = ?`, entryID).Scan(&seq); err != nil {
+		return "", 0, err
+	}
+	return branchID, seq, nil
 }
 
 func insertBranchSegment(ctx context.Context, conn *sql.Conn, branchID, tipID string, tipSeq int64, baseID *string, baseSeq int64) error {
