@@ -46,22 +46,27 @@ type SummaryAttemptOutcome struct {
 }
 
 type EffectPlan struct {
-	Kind             EffectKind
-	Key              EffectKey
-	TelemetryContext TelemetryContext
-	Generation       *Generation
-	Summary          *SummaryGeneration
-	AssistantEntryID string
-	SourceIndex      int
-	ArgsKey          string
-	Deferred         *Deferred
-	SourceEntryID    string
-	Handle           *DeferredHandle
-	HookName         HookName
-	Event            JSONValue
-	StreamOptions    AgentHarnessStreamOptions
-	Model            Model
-	Messages         []Message
+	Kind              EffectKind
+	Key               EffectKey
+	TelemetryContext  TelemetryContext
+	Generation        *Generation
+	Summary           *SummaryGeneration
+	AssistantEntryID  string
+	ToolResultEntryID string
+	ToolName          string
+	ToolCallID        string
+	ToolArgs          map[string]JSONValue
+	ToolContext       AgentHarnessToolContextSource
+	SourceIndex       int
+	ArgsKey           string
+	Deferred          *Deferred
+	SourceEntryID     string
+	Handle            *DeferredHandle
+	HookName          HookName
+	Event             JSONValue
+	StreamOptions     AgentHarnessStreamOptions
+	Model             Model
+	Messages          []Message
 }
 
 type EffectOutput struct {

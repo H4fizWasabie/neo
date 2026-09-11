@@ -26,6 +26,47 @@ type retryOutcome struct {
 	message AgentMessage
 }
 
+type namedTool struct {
+	calls int
+}
+
+func (*namedTool) Name() string         { return "echo" }
+func (*namedTool) Description() string  { return "echoes input" }
+func (*namedTool) Replay() ReplayPolicy { return ReplaySafe }
+func (t *namedTool) Execute(_ context.Context, _ string, args map[string]JSONValue, _ any, _ func(AgentToolResult)) (AgentToolResult, error) {
+	t.calls++
+	return AgentToolResult{Content: args["value"]}, nil
+}
+
+type toolModels struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (*toolModels) Resolve(context.Context, string, string) (Model, error) {
+	return Model{Provider: "provider", ModelID: "model"}, nil
+}
+
+func (m *toolModels) Stream(_ context.Context, _ Model, _ []Message, _ AgentHarnessStreamOptions) (<-chan AgentEvent, error) {
+	m.mu.Lock()
+	m.calls++
+	call := m.calls
+	m.mu.Unlock()
+	message := AgentMessage{Role: "assistant", StopReason: StopReasonStop, Content: "done"}
+	if call == 1 {
+		message.StopReason = StopReasonToolUse
+		message.ToolCalls = []AgentToolCall{{ID: "call-1", Name: "echo", Arguments: map[string]JSONValue{"value": "tool result"}}}
+	}
+	stream := make(chan AgentEvent, 1)
+	stream <- AgentEvent{Kind: "done", Message: &message}
+	close(stream)
+	return stream, nil
+}
+func (*toolModels) FetchDeferred(context.Context, Model, DeferredHandle, AgentHarnessStreamOptions) (DeferredResponse, error) {
+	return DeferredResponse{}, nil
+}
+func (*toolModels) CancelDeferred(context.Context, Model, DeferredHandle) error { return nil }
+
 func (m *retryModels) Resolve(context.Context, string, string) (Model, error) {
 	if m.resolveErr != nil {
 		return Model{}, m.resolveErr
@@ -201,6 +242,35 @@ func TestHarnessManualDriveParksBeforeProvider(t *testing.T) {
 		}
 	}
 	t.Fatal("manual prompt did not complete")
+}
+
+func TestHarnessExecutesToolBatchAndContinues(t *testing.T) {
+	tool := &namedTool{}
+	models := &toolModels{}
+	ctx := context.Background()
+	repo := NewMemorySessionRepo(SessionCodecOptions{})
+	session, err := repo.Create(ctx, SessionCreateOptions{ID: t.Name()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness, _, err := NewHarness(ctx, AgentHarnessOptions{Session: session, Models: models, Model: Model{Provider: "provider", ModelID: "model"}, ActiveToolNames: []string{"echo"}, Tools: []AgentHarnessTool{tool}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := harness.Prompt(ctx, PromptInput{Text: "prompt"})
+	if err != nil || !result.OK || result.Value.Kind != "completed" {
+		t.Fatalf("tool run = %v %+v", err, result)
+	}
+	if tool.calls != 1 {
+		t.Fatalf("tool calls = %d, want 1", tool.calls)
+	}
+	entries, err := session.FindEntries(ctx, EntryQuery{Order: OldestFirst})
+	if err != nil || len(entries) != 4 || entries[2].Message == nil || entries[2].Message.Role != "tool" {
+		t.Fatalf("tool entries = %v %+v", err, entries)
+	}
+	if registers, err := session.ListRegisters(ctx, RegisterOpToolArgs, ""); err != nil || len(registers) != 0 {
+		t.Fatalf("tool args registers = %v %+v", err, registers)
+	}
 }
 
 func newRetryHarness(t *testing.T, models Models, retry RetryPolicy) (*Harness, Session) {

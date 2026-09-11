@@ -17,6 +17,7 @@ type Harness struct {
 	telemetry          TelemetryContext
 	settings           *SettingsSnapshot
 	tools              []AgentHarnessTool
+	toolContext        AgentHarnessToolContextSource
 	resources          Resources
 	compaction         CompactionSettings
 	steeringMode       QueueMode
@@ -78,6 +79,7 @@ func NewHarness(ctx context.Context, options AgentHarnessOptions) (*Harness, []S
 		telemetry:          options.Telemetry,
 		settings:           NewSettingsSnapshot(options.StreamOptions, NormalizedRetryPolicy{MaxAttempts: maxAttempts, BaseDelayMs: options.Retry.BaseDelayMs}),
 		tools:              append([]AgentHarnessTool(nil), options.Tools...),
+		toolContext:        options.ToolContext,
 		resources:          cloneValue(options.Resources).(Resources),
 		compaction:         options.Compaction,
 		steeringMode:       options.SteeringMode,
@@ -499,6 +501,9 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 			}
 			return h.finishFailure(ctx, lane, operation, current, fmt.Errorf("operation failed"))
 		}
+		if phase.Kind == PhaseTools {
+			return h.driveTools(ctx, lane, operation, current)
+		}
 		if phase.Kind == PhaseDeferred {
 			if phase.Deferred == nil || phase.Deferred.Status != DeferredSuspended {
 				return RunOutcome{}, fmt.Errorf("deferred state is not resumable")
@@ -521,6 +526,10 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 				return h.finishFailure(ctx, lane, operation, current, fmt.Errorf("checkpoint has no payload"))
 			}
 			if phase.Checkpoint.Continuation.Kind == ContinuationMayFinish {
+				if !phase.Checkpoint.Continuation.IncludeFinalAssistant {
+					result := RunOutcome{Kind: "completed", RunID: operation.OperationID, LeafID: current.LeafID, Reason: "terminated_tools"}
+					return h.finishOutcome(ctx, lane, operation, current, result)
+				}
 				if state.Run.LatestAssistantEntryID == nil {
 					return h.finishFailure(ctx, lane, operation, current, fmt.Errorf("checkpoint has no final assistant"))
 				}
@@ -675,8 +684,20 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 			}
 			return h.settleDeferred(ctx, lane, operation, current, *pending.Run.Phase.Generation, message, handle)
 		}
-		if len(message.ToolCalls) != 0 || message.StopReason == StopReasonToolUse {
-			return h.settleGenerationError(ctx, lane, operation, current, *pending.Run.Phase.Generation, terminalGenerationError{fmt.Errorf("tool calls are not supported by the no-tool run")})
+		if len(message.ToolCalls) != 0 {
+			calls := make([]ToolCall, len(message.ToolCalls))
+			for i := range message.ToolCalls {
+				calls[i] = ToolCall{Status: "planned", SourceIndex: i, ResultEntryID: h.session.IDGenerator().Next()}
+			}
+			batch := RunPhase{Kind: PhaseTools, ToolBatch: &ToolBatch{AssistantEntryID: pending.Run.Phase.Generation.ResponseEntryID, Configuration: pending.Run.Phase.Generation.Context.Configuration, StepID: pending.Run.Phase.Generation.Context.StepID, TurnID: pending.Run.Phase.Generation.Context.StepID, Calls: calls}}
+			settled, err := h.settleGeneration(ctx, lane, operation, current, *pending.Run.Phase.Generation, message, batch)
+			if err != nil {
+				return RunOutcome{}, err
+			}
+			return h.driveTools(ctx, lane, operation, settled)
+		}
+		if message.StopReason == StopReasonToolUse {
+			return h.settleGenerationError(ctx, lane, operation, current, *pending.Run.Phase.Generation, terminalGenerationError{fmt.Errorf("tool_use response has no tool calls")})
 		}
 		result := RunOutcome{Kind: "completed", RunID: operation.OperationID, LeafID: stringPointer(pending.Run.Phase.Generation.ResponseEntryID), FinalEntryID: stringPointer(pending.Run.Phase.Generation.ResponseEntryID), FinalMessage: &message}
 		settled, err := h.settleGeneration(ctx, lane, operation, current, *pending.Run.Phase.Generation, message, RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationMayFinish, IncludeFinalAssistant: true}, TriggerEntryID: pending.Run.Phase.Generation.ResponseEntryID}})
@@ -697,6 +718,447 @@ func (h *Harness) runBeforeRequest(ctx context.Context, fx *runtimeEffects, oper
 		}
 		return err
 	})
+}
+
+func (h *Harness) driveTools(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation) (RunOutcome, error) {
+	if current.State.Run != nil && current.State.Run.Settings.ToolExecution == ToolExecutionParallel {
+		return h.driveToolsParallel(ctx, lane, operation, current)
+	}
+	toolContext, err := h.resolveToolContext(ctx)
+	if err != nil {
+		return RunOutcome{}, err
+	}
+	for {
+		batch := current.State.Run.Phase.ToolBatch
+		if batch == nil {
+			return RunOutcome{}, fmt.Errorf("tool phase has no batch")
+		}
+		index := -1
+		for i, call := range batch.Calls {
+			if call.Status != "completed" {
+				index = i
+				break
+			}
+		}
+		if index == -1 {
+			return RunOutcome{}, fmt.Errorf("tool batch has no completion transition")
+		}
+		call, source, err := h.toolCall(ctx, lane, *batch, index)
+		if err != nil {
+			return RunOutcome{}, err
+		}
+		args := map[string]JSONValue{}
+		if call.Status == "effect_pending" {
+			if sourceEntry, sourceErr := lane.view.GetEntry(ctx, batch.AssistantEntryID); sourceErr == nil && sourceEntry != nil && sourceEntry.Message != nil && sourceEntry.Message.StopReason == StopReasonLength {
+				return h.settleTool(ctx, lane, operation, current, index, call, source.ID, AgentToolResult{Content: "tool call was not executed because the assistant reached its output limit", IsError: true})
+			}
+			key := toolArgsKey(operation.OperationID, batch.StepID, call.SourceIndex)
+			register, err := h.session.GetRegister(ctx, RegisterOpToolArgs, key)
+			if err != nil {
+				return RunOutcome{}, err
+			}
+			if register == nil {
+				return RunOutcome{}, fmt.Errorf("tool arguments are missing for %s", key)
+			}
+			value, ok := register.Value.(map[string]JSONValue)
+			if !ok {
+				return RunOutcome{}, fmt.Errorf("tool arguments have invalid type for %s", key)
+			}
+			args = value
+			tool, active := h.activeTool(batch.Configuration, source.Name)
+			if !active || tool.Replay() != call.Replay || call.Replay != ReplaySafe {
+				result := AgentToolResult{Content: "tool effect was interrupted and is not safe to replay", IsError: true}
+				return h.settleTool(ctx, lane, operation, current, index, call, source.ID, result)
+			}
+		} else {
+			if sourceEntry, sourceErr := lane.view.GetEntry(ctx, batch.AssistantEntryID); sourceErr == nil && sourceEntry != nil && sourceEntry.Message != nil && sourceEntry.Message.StopReason == StopReasonLength {
+				return h.settleTool(ctx, lane, operation, current, index, call, source.ID, AgentToolResult{Content: "tool call was not executed because the assistant reached its output limit", IsError: true})
+			}
+			if source.Arguments != nil {
+				args = cloneValue(source.Arguments).(map[string]JSONValue)
+			}
+			tool, ok := h.activeTool(batch.Configuration, source.Name)
+			if !ok {
+				return h.settleTool(ctx, lane, operation, current, index, call, source.ID, AgentToolResult{Content: fmt.Sprintf("unknown tool %q", source.Name), IsError: true})
+			}
+			output, err := h.harnessToolHook(ctx, lane, operation, source, args)
+			if err != nil {
+				return h.settleTool(ctx, lane, operation, current, index, call, source.ID, AgentToolResult{Content: err.Error(), IsError: true})
+			}
+			if blocked, terminate, reason := blockedTool(output); blocked {
+				return h.settleTool(ctx, lane, operation, current, index, call, source.ID, AgentToolResult{Content: reason, IsError: true, Terminate: terminate})
+			}
+			if replacement, ok := output["arguments"].(map[string]JSONValue); ok {
+				args = replacement
+			}
+			if err := h.commitToolIntent(ctx, lane, operation, current, index, call, args, tool.Replay()); err != nil {
+				return RunOutcome{}, err
+			}
+			current, err = h.currentOperation(ctx, lane)
+			if err != nil {
+				return RunOutcome{}, err
+			}
+			call = current.State.Run.Phase.ToolBatch.Calls[index]
+		}
+		h.events.Emit(ctx, HarnessEvent{Type: string(EventToolStart), Lane: lane.name, Payload: map[string]JSONValue{"toolCallId": source.ID, "name": source.Name, "arguments": cloneValue(args)}})
+		output, runErr := h.runTool(ctx, lane, operation, source, args, toolContext)
+		if runErr != nil {
+			output = AgentToolResult{Content: runErr.Error(), IsError: true}
+		}
+		output, err = h.afterTool(ctx, lane, operation, source, args, output)
+		if err != nil {
+			output = AgentToolResult{Content: err.Error(), IsError: true}
+		}
+		current, err = h.currentOperation(ctx, lane)
+		if err != nil {
+			return RunOutcome{}, err
+		}
+		result, err := h.settleTool(ctx, lane, operation, current, index, call, source.ID, output)
+		if err != nil || result.Kind == "completed" || result.Kind == "failed" || result.Kind == "suspended" {
+			return result, err
+		}
+		current, err = h.currentOperation(ctx, lane)
+		if err != nil {
+			return RunOutcome{}, err
+		}
+	}
+}
+
+func (h *Harness) driveToolsParallel(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation) (RunOutcome, error) {
+	toolContext, err := h.resolveToolContext(ctx)
+	if err != nil {
+		return RunOutcome{}, err
+	}
+	batch := current.State.Run.Phase.ToolBatch
+	if batch == nil {
+		return RunOutcome{}, fmt.Errorf("tool phase has no batch")
+	}
+	type pendingTool struct {
+		index  int
+		call   ToolCall
+		source AgentToolCall
+		args   map[string]JSONValue
+		result AgentToolResult
+		err    error
+	}
+	pending := make([]*pendingTool, 0, len(batch.Calls))
+	for index := range batch.Calls {
+		call, source, err := h.toolCall(ctx, lane, *batch, index)
+		if err != nil {
+			return RunOutcome{}, err
+		}
+		if call.Status == "completed" {
+			continue
+		}
+		if entry, entryErr := lane.view.GetEntry(ctx, batch.AssistantEntryID); entryErr == nil && entry != nil && entry.Message != nil && entry.Message.StopReason == StopReasonLength {
+			result, settleErr := h.settleTool(ctx, lane, operation, current, index, call, source.ID, AgentToolResult{Content: "tool call was not executed because the assistant reached its output limit", IsError: true})
+			if settleErr != nil || result.Kind != "" {
+				return result, settleErr
+			}
+			current, err = h.currentOperation(ctx, lane)
+			if err != nil {
+				return RunOutcome{}, err
+			}
+			batch = current.State.Run.Phase.ToolBatch
+			continue
+		}
+		args := map[string]JSONValue{}
+		if call.Status == "effect_pending" {
+			register, getErr := h.session.GetRegister(ctx, RegisterOpToolArgs, toolArgsKey(operation.OperationID, batch.StepID, call.SourceIndex))
+			if getErr != nil {
+				return RunOutcome{}, getErr
+			}
+			if register == nil {
+				return RunOutcome{}, fmt.Errorf("tool arguments are missing")
+			}
+			var ok bool
+			args, ok = register.Value.(map[string]JSONValue)
+			if !ok {
+				return RunOutcome{}, fmt.Errorf("tool arguments have invalid type")
+			}
+			tool, active := h.activeTool(batch.Configuration, source.Name)
+			if !active || tool.Replay() != call.Replay || call.Replay != ReplaySafe {
+				result, settleErr := h.settleTool(ctx, lane, operation, current, index, call, source.ID, AgentToolResult{Content: "tool effect was interrupted and is not safe to replay", IsError: true})
+				if settleErr != nil || result.Kind != "" {
+					return result, settleErr
+				}
+				current, err = h.currentOperation(ctx, lane)
+				if err != nil {
+					return RunOutcome{}, err
+				}
+				batch = current.State.Run.Phase.ToolBatch
+				continue
+			}
+		} else {
+			if source.Arguments != nil {
+				args = cloneValue(source.Arguments).(map[string]JSONValue)
+			}
+			tool, active := h.activeTool(batch.Configuration, source.Name)
+			if !active {
+				result, settleErr := h.settleTool(ctx, lane, operation, current, index, call, source.ID, AgentToolResult{Content: fmt.Sprintf("unknown tool %q", source.Name), IsError: true})
+				if settleErr != nil || result.Kind != "" {
+					return result, settleErr
+				}
+				current, err = h.currentOperation(ctx, lane)
+				if err != nil {
+					return RunOutcome{}, err
+				}
+				batch = current.State.Run.Phase.ToolBatch
+				continue
+			}
+			values, hookErr := h.harnessToolHook(ctx, lane, operation, source, args)
+			if hookErr != nil {
+				result, settleErr := h.settleTool(ctx, lane, operation, current, index, call, source.ID, AgentToolResult{Content: hookErr.Error(), IsError: true})
+				if settleErr != nil || result.Kind != "" {
+					return result, settleErr
+				}
+				current, err = h.currentOperation(ctx, lane)
+				if err != nil {
+					return RunOutcome{}, err
+				}
+				batch = current.State.Run.Phase.ToolBatch
+				continue
+			}
+			if blocked, terminate, reason := blockedTool(values); blocked {
+				result, settleErr := h.settleTool(ctx, lane, operation, current, index, call, source.ID, AgentToolResult{Content: reason, IsError: true, Terminate: terminate})
+				if settleErr != nil || result.Kind != "" {
+					return result, settleErr
+				}
+				current, err = h.currentOperation(ctx, lane)
+				if err != nil {
+					return RunOutcome{}, err
+				}
+				batch = current.State.Run.Phase.ToolBatch
+				continue
+			}
+			if replacement, ok := values["arguments"].(map[string]JSONValue); ok {
+				args = replacement
+			}
+			if err := h.commitToolIntent(ctx, lane, operation, current, index, call, args, tool.Replay()); err != nil {
+				return RunOutcome{}, err
+			}
+			current, err = h.currentOperation(ctx, lane)
+			if err != nil {
+				return RunOutcome{}, err
+			}
+			call = current.State.Run.Phase.ToolBatch.Calls[index]
+			batch = current.State.Run.Phase.ToolBatch
+		}
+		pending = append(pending, &pendingTool{index: index, call: call, source: source, args: args})
+		h.events.Emit(ctx, HarnessEvent{Type: string(EventToolStart), Lane: lane.name, Payload: map[string]JSONValue{"toolCallId": source.ID, "name": source.Name, "arguments": cloneValue(args)}})
+	}
+	var wg sync.WaitGroup
+	for _, item := range pending {
+		item := item
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			item.result, item.err = h.runTool(ctx, lane, operation, item.source, item.args, toolContext)
+		}()
+	}
+	wg.Wait()
+	for _, item := range pending {
+		if item.err != nil {
+			item.result = AgentToolResult{Content: item.err.Error(), IsError: true}
+		}
+		item.result, err = h.afterTool(ctx, lane, operation, item.source, item.args, item.result)
+		if err != nil {
+			item.result = AgentToolResult{Content: err.Error(), IsError: true}
+		}
+		current, err = h.currentOperation(ctx, lane)
+		if err != nil {
+			return RunOutcome{}, err
+		}
+		result, settleErr := h.settleTool(ctx, lane, operation, current, item.index, current.State.Run.Phase.ToolBatch.Calls[item.index], item.source.ID, item.result)
+		if settleErr != nil || result.Kind != "" {
+			return result, settleErr
+		}
+	}
+	return RunOutcome{}, nil
+}
+
+func (h *Harness) currentOperation(ctx context.Context, lane *runtimeLane) (CurrentOperation, error) {
+	restored, err := Restore(ctx, h.session, lane.name)
+	if err != nil || restored.Current == nil {
+		if err == nil {
+			err = fmt.Errorf("operation disappeared")
+		}
+		return CurrentOperation{}, err
+	}
+	return *restored.Current, nil
+}
+
+func (h *Harness) resolveToolContext(ctx context.Context) (AgentHarnessToolContextSource, error) {
+	switch source := h.toolContext.(type) {
+	case func(context.Context) (AgentHarnessToolContextSource, error):
+		return source(ctx)
+	case func(context.Context) (any, error):
+		return source(ctx)
+	case func(context.Context) any:
+		return source(ctx), nil
+	default:
+		return h.toolContext, nil
+	}
+}
+
+func (h *Harness) toolCall(ctx context.Context, lane *runtimeLane, batch ToolBatch, index int) (ToolCall, AgentToolCall, error) {
+	entry, err := lane.view.GetEntry(ctx, batch.AssistantEntryID)
+	if err != nil || entry == nil || entry.Message == nil {
+		if err == nil {
+			err = fmt.Errorf("tool assistant entry is missing")
+		}
+		return ToolCall{}, AgentToolCall{}, err
+	}
+	if index < 0 || index >= len(entry.Message.ToolCalls) {
+		return ToolCall{}, AgentToolCall{}, fmt.Errorf("tool source index %d is missing", index)
+	}
+	return batch.Calls[index], entry.Message.ToolCalls[index], nil
+}
+
+func (h *Harness) activeTool(config LaneConfiguration, name string) (AgentHarnessTool, bool) {
+	for _, active := range config.ActiveToolNames {
+		if active == name {
+			for _, tool := range h.tools {
+				if tool != nil && tool.Name() == name {
+					return tool, true
+				}
+			}
+			return nil, false
+		}
+	}
+	return nil, false
+}
+
+func toolArgsKey(operationID, stepID string, index int) string {
+	return fmt.Sprintf("%s:%s:%d", operationID, stepID, index)
+}
+
+func (h *Harness) harnessToolHook(ctx context.Context, lane *runtimeLane, operation Operation, call AgentToolCall, args map[string]JSONValue) (map[string]JSONValue, error) {
+	var output JSONValue
+	err := h.effect(ctx, ActionInfo{Kind: "hook", Description: "before_tool"}, func(ctx context.Context) error {
+		var err error
+		output, err = h.hooks.Run(ctx, HookInvocation{Name: HookBeforeTool, Lane: lane.name, RunID: operation.OperationID, Event: map[string]JSONValue{"toolCallId": call.ID, "name": call.Name, "arguments": cloneValue(args)}})
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	values, _ := output.(map[string]JSONValue)
+	if output != nil && values == nil {
+		return map[string]JSONValue{"block": map[string]JSONValue{"reason": "invalid before_tool output"}}, nil
+	}
+	return values, nil
+}
+
+func blockedTool(values map[string]JSONValue) (bool, bool, string) {
+	block, ok := values["block"].(map[string]JSONValue)
+	if !ok {
+		return false, false, ""
+	}
+	reason, _ := block["reason"].(string)
+	terminate, _ := block["terminate"].(bool)
+	if reason == "" {
+		reason = "tool blocked"
+	}
+	return true, terminate, reason
+}
+
+func (h *Harness) commitToolIntent(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation, index int, call ToolCall, args map[string]JSONValue, replay ReplayPolicy) error {
+	next := current.State
+	batch := next.Run.Phase.ToolBatch
+	if batch == nil {
+		return fmt.Errorf("tool intent has no batch")
+	}
+	nextBatch := *batch
+	nextBatch.Calls = append([]ToolCall(nil), batch.Calls...)
+	nextBatch.Calls[index].Status = "effect_pending"
+	nextBatch.Calls[index].Replay = replay
+	next.Run.Phase.ToolBatch = &nextBatch
+	key := toolArgsKey(operation.OperationID, batch.StepID, call.SourceIndex)
+	return h.effect(ctx, ActionInfo{Kind: "transition", Description: "tool effect pending"}, func(ctx context.Context) error {
+		return h.line(lane.name).Do(ctx, func() error {
+			valid, err := (&runtimeEffects{harness: h, lane: lane}).current(ctx, current)
+			if err != nil || !valid {
+				if err == nil {
+					err = fmt.Errorf("stale operation state")
+				}
+				return err
+			}
+			_, err = h.session.Commit(ctx, Transaction{Writes: []Write{registerSet(RegisterOpToolArgs, key, args), registerSet(RegisterOpState, operation.OperationID, next)}})
+			return err
+		})
+	})
+}
+
+func (h *Harness) runTool(ctx context.Context, lane *runtimeLane, operation Operation, call AgentToolCall, args map[string]JSONValue, toolContext AgentHarnessToolContextSource) (AgentToolResult, error) {
+	_, ok := h.activeTool(mustActiveConfiguration(ctx, lane), call.Name)
+	if !ok {
+		return AgentToolResult{}, fmt.Errorf("unknown active tool %q", call.Name)
+	}
+	var output EffectOutput
+	err := h.effect(ctx, ActionInfo{Kind: "tool", Description: "tool effect"}, func(ctx context.Context) error {
+		var err error
+		output, err = (&runtimeEffects{harness: h, lane: lane}).Run(ctx, EffectPlan{Kind: EffectTool, Key: EffectKey(fmt.Sprintf("%s:tool:%s", operation.OperationID, call.ID)), ToolName: call.Name, ToolCallID: call.ID, ToolArgs: args, ToolContext: toolContext})
+		return err
+	})
+	if err != nil {
+		return AgentToolResult{}, err
+	}
+	if output.ToolResult == nil {
+		return AgentToolResult{}, fmt.Errorf("tool returned no result")
+	}
+	return *output.ToolResult, nil
+}
+
+func (h *Harness) afterTool(ctx context.Context, lane *runtimeLane, operation Operation, call AgentToolCall, args map[string]JSONValue, result AgentToolResult) (AgentToolResult, error) {
+	var output JSONValue
+	err := h.effect(ctx, ActionInfo{Kind: "hook", Description: "after_tool"}, func(ctx context.Context) error {
+		var err error
+		output, err = h.hooks.Run(ctx, HookInvocation{Name: HookAfterTool, Lane: lane.name, RunID: operation.OperationID, Event: map[string]JSONValue{"toolCallId": call.ID, "name": call.Name, "arguments": cloneValue(args), "result": cloneValue(result), "isError": result.IsError}})
+		return err
+	})
+	if err != nil {
+		return result, err
+	}
+	values, _ := output.(map[string]JSONValue)
+	if replacement, ok := values["result"].(AgentToolResult); ok {
+		result = replacement
+	}
+	if terminate, ok := values["terminate"].(bool); ok {
+		result.Terminate = terminate
+	}
+	return result, nil
+}
+
+func mustActiveConfiguration(ctx context.Context, lane *runtimeLane) LaneConfiguration {
+	config, err := lane.configuration(ctx)
+	if err != nil {
+		return LaneConfiguration{}
+	}
+	return config
+}
+
+func (h *Harness) settleTool(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation, index int, call ToolCall, toolCallID string, result AgentToolResult) (RunOutcome, error) {
+	settlement := SettlementResult{}
+	err := h.effect(ctx, ActionInfo{Kind: "settlement", Description: "tool result"}, func(ctx context.Context) error {
+		var err error
+		settlement, err = (&runtimeEffects{harness: h, lane: lane}).CommitEffectSettlement(ctx, current, EffectPlan{Kind: EffectTool, Key: EffectKey(fmt.Sprintf("%s:tool:%d", operation.OperationID, index)), AssistantEntryID: current.State.Run.Phase.ToolBatch.AssistantEntryID, SourceIndex: index, ToolCallID: toolCallID, ToolResultEntryID: call.ResultEntryID}, SettlementOutput{Kind: "tool", Key: EffectKey(operation.OperationID), ToolResult: &result}, h.telemetry)
+		return err
+	})
+	if err != nil {
+		return RunOutcome{}, err
+	}
+	h.events.Emit(ctx, HarnessEvent{Type: string(EventToolEnd), Lane: lane.name, Payload: cloneValue(result)})
+	if result.Usage != nil {
+		h.events.Emit(ctx, HarnessEvent{Type: string(EventUsage), Lane: lane.name, Payload: cloneValue(*result.Usage)})
+	}
+	if settlement.Current.State.Run.Phase.Kind == PhaseCheckpoint {
+		if settlement.Current.State.Run.Phase.Checkpoint.Continuation.Kind == ContinuationMayFinish {
+			return h.finishOutcome(ctx, lane, operation, settlement.Current, RunOutcome{Kind: "completed", RunID: operation.OperationID, LeafID: settlement.Current.LeafID, Reason: "terminated_tools"})
+		}
+		return h.drive(ctx, lane, operation, settlement.Current.State)
+	}
+	return RunOutcome{}, nil
 }
 
 func (h *Harness) runAssistantAttempt(ctx context.Context, lane *runtimeLane, operation Operation, pending OperationState, fx *runtimeEffects) (AgentMessage, error) {
@@ -852,6 +1314,9 @@ func (e *runtimeEffects) CommitTransition(ctx context.Context, current CurrentOp
 }
 
 func (e *runtimeEffects) CommitEffectSettlement(ctx context.Context, current CurrentOperation, plan EffectPlan, output SettlementOutput, _ TelemetryContext) (SettlementResult, error) {
+	if plan.Kind == EffectTool {
+		return e.commitToolSettlement(ctx, current, plan, output)
+	}
 	if plan.Generation == nil || output.Message == nil {
 		return SettlementResult{}, fmt.Errorf("assistant settlement is incomplete")
 	}
@@ -897,6 +1362,89 @@ func (e *runtimeEffects) CommitEffectSettlement(ctx context.Context, current Cur
 	return SettlementResult{Current: current}, nil
 }
 
+func (e *runtimeEffects) commitToolSettlement(ctx context.Context, current CurrentOperation, plan EffectPlan, output SettlementOutput) (SettlementResult, error) {
+	if output.ToolResult == nil || current.State.Run == nil || current.State.Run.Phase.ToolBatch == nil {
+		return SettlementResult{}, fmt.Errorf("tool settlement is incomplete")
+	}
+	batch := current.State.Run.Phase.ToolBatch
+	if plan.SourceIndex < 0 || plan.SourceIndex >= len(batch.Calls) {
+		return SettlementResult{}, fmt.Errorf("tool source index %d is out of range", plan.SourceIndex)
+	}
+	call := batch.Calls[plan.SourceIndex]
+	if call.Status == "completed" {
+		return SettlementResult{Current: current}, nil
+	}
+	result := *output.ToolResult
+	resultID := call.ResultEntryID
+	if plan.ToolResultEntryID != "" {
+		resultID = plan.ToolResultEntryID
+	}
+	metadata := map[string]JSONValue{"isError": result.IsError}
+	if result.Details != nil {
+		metadata["details"] = cloneValue(result.Details)
+	}
+	message := AgentMessage{Role: "tool", ToolCallID: plan.ToolCallID, Content: cloneValue(result.Content), Metadata: metadata, Usage: result.Usage}
+	entry := Entry{EntryBase: EntryBase{ID: resultID, ParentID: stringPointer(batch.AssistantEntryID), Type: EntryMessage}, Message: messageCopy(message), Terminate: result.Terminate}
+	next := current.State
+	nextBatch := *batch
+	nextBatch.Calls = append([]ToolCall(nil), batch.Calls...)
+	nextBatch.Calls[plan.SourceIndex].Status = "completed"
+	nextBatch.Calls[plan.SourceIndex].Terminate = result.Terminate
+	allCompleted := true
+	allTerminate := true
+	for _, item := range nextBatch.Calls {
+		if item.Status != "completed" {
+			allCompleted = false
+			break
+		}
+		if !item.Terminate {
+			allTerminate = false
+		}
+	}
+	if allCompleted {
+		continuation := Continuation{Kind: ContinuationNeedAssistant}
+		if allTerminate {
+			continuation = Continuation{Kind: ContinuationMayFinish}
+		}
+		next.Run.Phase = RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: continuation, TriggerEntryID: resultID}}
+	} else {
+		nextBatch.Calls = append([]ToolCall(nil), nextBatch.Calls...)
+		next.Run.Phase.ToolBatch = &nextBatch
+	}
+	writes := []Write{{Kind: WriteEntry, Entry: &EntryWrite{Entry: entry}}}
+	if result.Usage != nil {
+		usageID := e.harness.session.IDGenerator().Next()
+		writes = append(writes, Write{Kind: WriteUsage, Usage: &UsageWrite{Row: UsageRow{ID: usageID, Usage: *result.Usage, EntryID: &resultID}}})
+	}
+	writes = append(writes, registerSet(RegisterLaneLeaf, e.lane.name, stringPointer(resultID)))
+	if allCompleted {
+		for _, item := range batch.Calls {
+			writes = append(writes, registerDelete(RegisterOpToolArgs, fmt.Sprintf("%s:%s:%d", current.Operation.OperationID, batch.StepID, item.SourceIndex)))
+		}
+	}
+	writes = append(writes, registerSet(RegisterOpState, current.Operation.OperationID, next))
+	var commit CommitResult
+	if err := e.harness.line(e.lane.name).Do(ctx, func() error {
+		valid, err := e.current(ctx, current)
+		if err != nil || !valid {
+			if err == nil {
+				err = fmt.Errorf("stale operation state")
+			}
+			return err
+		}
+		commit, err = e.harness.session.Commit(ctx, Transaction{Writes: writes})
+		return err
+	}); err != nil {
+		return SettlementResult{}, err
+	}
+	current.State = next
+	current.LeafID = stringPointer(resultID)
+	if len(commit.Seqs) != 0 {
+		current.OperationStateSeq = commit.Seqs[len(commit.Seqs)-1]
+	}
+	return SettlementResult{Current: current}, nil
+}
+
 func (e *runtimeEffects) CommitTerminal(ctx context.Context, current CurrentOperation, result OperationResult) (*CurrentOperation, error) {
 	run, ok := result.(RunOutcome)
 	if !ok {
@@ -918,6 +1466,9 @@ func (e *runtimeEffects) CommitTerminal(ctx context.Context, current CurrentOper
 	completion := ""
 	if run.Kind == "completed" {
 		completion = "assistant"
+		if run.Reason == "terminated_tools" {
+			completion = "terminated_tools"
+		}
 	}
 	writes := append(cleanup, registerSet(RegisterLaneLastResult, e.lane.name, LaneLastResult{OperationID: current.Operation.OperationID, Kind: OperationRun, Outcome: run.Kind, LeafID: run.LeafID, FinalAssistantEntryID: run.FinalEntryID, RunCompletion: completion, Error: run.Error}), registerSet(RegisterLaneState, e.lane.name, laneState))
 	if err := e.harness.line(e.lane.name).Do(ctx, func() error {
@@ -981,9 +1532,32 @@ func (e *runtimeEffects) Run(ctx context.Context, plan EffectPlan) (EffectOutput
 			message.Role = "assistant"
 		}
 		return EffectOutput{Kind: "assistant", Key: plan.Key, Message: message}, nil
+	case EffectTool:
+		tool, err := e.tool(plan.ToolName)
+		if err != nil {
+			return EffectOutput{}, err
+		}
+		updates := func(result AgentToolResult) {
+			e.harness.events.Emit(ctx, HarnessEvent{Type: string(EventToolUpdate), Lane: e.lane.name, Payload: cloneValue(result)})
+		}
+		args := plan.ToolArgs
+		if args == nil {
+			args = map[string]JSONValue{}
+		}
+		result, err := tool.Execute(ctx, plan.ToolCallID, cloneValue(args).(map[string]JSONValue), plan.ToolContext, updates)
+		return EffectOutput{Kind: "tool", Key: plan.Key, ToolResult: &result, IsError: result.IsError}, err
 	default:
 		return EffectOutput{}, fmt.Errorf("unsupported effect kind %q", plan.Kind)
 	}
+}
+
+func (e *runtimeEffects) tool(name string) (AgentHarnessTool, error) {
+	for _, tool := range e.harness.tools {
+		if tool != nil && tool.Name() == name {
+			return tool, nil
+		}
+	}
+	return nil, fmt.Errorf("unknown tool %q", name)
 }
 
 func (e *runtimeEffects) Sleep(ctx context.Context, delayMs int64, _ TelemetryContext) error {
