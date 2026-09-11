@@ -180,16 +180,17 @@ const (
 )
 
 type Generation struct {
-	Status              GenerationStatus  `json:"status"`
-	Context             GenerationContext `json:"context"`
-	Attempt             int64             `json:"attempt,omitempty"`
-	NextAttempt         int64             `json:"nextAttempt,omitempty"`
-	ResponseEntryID     string            `json:"responseEntryId,omitempty"`
-	UsageID             string            `json:"usageId,omitempty"`
-	IntendedOutputLimit int64             `json:"intendedOutputLimit,omitempty"`
-	ContextWindow       int64             `json:"contextWindow,omitempty"`
-	NotBefore           int64             `json:"notBefore,omitempty"`
-	ErrorMessage        string            `json:"errorMessage,omitempty"`
+	Status               GenerationStatus           `json:"status"`
+	Context              GenerationContext          `json:"context"`
+	AttemptStreamOptions *AgentHarnessStreamOptions `json:"attemptStreamOptions,omitempty"`
+	Attempt              int64                      `json:"attempt,omitempty"`
+	NextAttempt          int64                      `json:"nextAttempt,omitempty"`
+	ResponseEntryID      string                     `json:"responseEntryId,omitempty"`
+	UsageID              string                     `json:"usageId,omitempty"`
+	IntendedOutputLimit  int64                      `json:"intendedOutputLimit,omitempty"`
+	ContextWindow        int64                      `json:"contextWindow,omitempty"`
+	NotBefore            int64                      `json:"notBefore,omitempty"`
+	ErrorMessage         string                     `json:"errorMessage,omitempty"`
 }
 
 type ToolBatch struct {

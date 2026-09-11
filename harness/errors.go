@@ -85,20 +85,21 @@ type HarnessClosed struct{ Message string }
 func (e *HarnessClosed) Error() string { return e.Message }
 
 type RunOutcome struct {
-	Kind         string          `json:"kind"`
-	RunID        string          `json:"runId,omitempty"`
-	LeafID       *string         `json:"leafId,omitempty"`
-	FinalEntryID *string         `json:"finalEntryId,omitempty"`
-	FinalMessage *AgentMessage   `json:"finalMessage,omitempty"`
-	Reason       string          `json:"reason,omitempty"`
-	Deferred     *DeferredHandle `json:"deferred,omitempty"`
-	Error        *OperationError `json:"error,omitempty"`
+	Kind         string                     `json:"kind"`
+	RunID        string                     `json:"runId,omitempty"`
+	LeafID       *string                    `json:"leafId,omitempty"`
+	FinalEntryID *string                    `json:"finalEntryId,omitempty"`
+	FinalMessage *AgentMessage              `json:"finalMessage,omitempty"`
+	Reason       string                     `json:"reason,omitempty"`
+	Deferred     *DeferredHandle            `json:"deferred,omitempty"`
+	Missing      *MissingIdentitySuspension `json:"missing,omitempty"`
+	Error        *OperationError            `json:"error,omitempty"`
 }
 
 type MissingIdentitySuspension struct {
-	Reason        string   `json:"reason"`
-	MissingTools  []string `json:"missingTools,omitempty"`
-	MissingModels []string `json:"missingModels,omitempty"`
+	Reason string   `json:"reason"`
+	Tools  []string `json:"tools,omitempty"`
+	Models []string `json:"models,omitempty"`
 }
 
 type RunResult = Result[RunOutcome, error]
