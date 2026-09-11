@@ -556,3 +556,194 @@ func waitForActionOrDone(t *testing.T, harness *Harness, done <-chan Result[RunO
 	t.Fatal("manual action was not scheduled")
 	return false
 }
+
+func TestHarnessNextRunCaptureAndCancellation(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemorySessionRepo(SessionCodecOptions{})
+	session, err := repo.Create(ctx, SessionCreateOptions{ID: t.Name()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	models := &scriptedModels{}
+	harness, _, err := NewHarness(ctx, AgentHarnessOptions{Session: session, Models: models, Model: Model{Provider: "provider", ModelID: "model"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lane := harness.runtimeLane
+	queued, err := lane.NextRun(ctx, PromptInput{Text: "cancel me"})
+	if err != nil || !queued.OK || queued.Value.EntryID == "" {
+		t.Fatalf("next-run = %v %+v", err, queued)
+	}
+	cancelled, err := lane.CancelQueued(ctx, queued.Value.EntryID)
+	if err != nil || !cancelled.OK || cancelled.Value.Kind != "cancelled" {
+		t.Fatalf("cancel = %v %+v", err, cancelled)
+	}
+	retry, err := lane.CancelQueued(ctx, queued.Value.EntryID)
+	if err != nil || !retry.OK || retry.Value.Kind != "not_found" {
+		t.Fatalf("cancel retry = %v %+v", err, retry)
+	}
+
+	queued, err = lane.NextRun(ctx, PromptInput{Text: "run me"})
+	if err != nil || !queued.OK {
+		t.Fatalf("next-run for capture = %v %+v", err, queued)
+	}
+	result, err := lane.Prompt(ctx, PromptInput{})
+	if err != nil || !result.OK || result.Value.Kind != "completed" {
+		t.Fatalf("captured next-run prompt = %v %+v", err, result)
+	}
+	entries, err := session.FindEntries(ctx, EntryQuery{Order: OldestFirst})
+	if err != nil || len(entries) != 2 || entries[0].Message == nil || entries[0].Message.Content != "run me" {
+		t.Fatalf("captured entries = %v %+v", err, entries)
+	}
+	consumed, err := lane.CancelQueued(ctx, queued.Value.EntryID)
+	if err != nil || !consumed.OK || consumed.Value.Kind != "already_consumed" {
+		t.Fatalf("consumed cancellation = %v %+v", err, consumed)
+	}
+}
+
+func TestHarnessDefersActiveTreeWritesUntilCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemorySessionRepo(SessionCodecOptions{})
+	session, err := repo.Create(ctx, SessionCreateOptions{ID: t.Name()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness, _, err := NewHarness(ctx, AgentHarnessOptions{Session: session, Models: &scriptedModels{}, Model: Model{Provider: "provider", ModelID: "model"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedRunOperation(t, session, RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationNeedAssistant}}}, nil)
+	id, err := harness.runtimeLane.Session().AppendMessage(ctx, AgentMessage{Role: "user", Content: "deferred"})
+	if err != nil || id == "" {
+		t.Fatalf("deferred append = %v %q", err, id)
+	}
+	register, err := session.GetRegister(ctx, RegisterPendingEntry, id)
+	if err != nil || register == nil {
+		t.Fatalf("pending register = %v %+v", err, register)
+	}
+	current, err := harness.currentOperation(ctx, harness.runtimeLane)
+	if err != nil || len(current.State.Run.Inbox.Writes) != 1 || current.State.Run.Inbox.Writes[0] != id {
+		t.Fatalf("pending write state = %v %+v", err, current)
+	}
+	result, err := harness.Resume(ctx)
+	if err != nil || !result.OK || result.Value.Run == nil || result.Value.Run.Kind != "completed" {
+		t.Fatalf("deferred write resume = %v %+v", err, result)
+	}
+	entries, err := session.FindEntries(ctx, EntryQuery{Order: OldestFirst})
+	if err != nil || len(entries) != 3 || entries[1].ID != id || entries[1].Message == nil || entries[1].Message.Content != "deferred" {
+		t.Fatalf("deferred write entries = %v %+v", err, entries)
+	}
+	register, err = session.GetRegister(ctx, RegisterPendingEntry, id)
+	if err != nil || register != nil {
+		t.Fatalf("pending register survived consumption = %v %+v", err, register)
+	}
+}
+
+func TestHarnessConfigurationSettersValidateAndApply(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemorySessionRepo(SessionCodecOptions{})
+	session, err := repo.Create(ctx, SessionCreateOptions{ID: t.Name()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness, _, err := NewHarness(ctx, AgentHarnessOptions{Session: session, Models: &scriptedModels{}, Model: Model{Provider: "provider", ModelID: "model"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := CompactionSettings{Enabled: true, ReserveTokens: 10, KeepRecentTokens: 20}
+	if err := harness.SetCompactionSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := harness.GetCompactionSettings(ctx); err != nil || got != settings {
+		t.Fatalf("compaction settings = %v %+v", err, got)
+	}
+	if err := harness.SetSteeringMode(ctx, QueueOneAtATime); err != nil {
+		t.Fatal(err)
+	}
+	if err := harness.SetFollowUpMode(ctx, QueueOneAtATime); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := harness.GetSteeringMode(ctx); got != QueueOneAtATime {
+		t.Fatalf("steering mode = %q", got)
+	}
+	if got, _ := harness.GetFollowUpMode(ctx); got != QueueOneAtATime {
+		t.Fatalf("follow-up mode = %q", got)
+	}
+	if err := harness.SetSteeringMode(ctx, QueueMode("invalid")); err == nil {
+		t.Fatal("invalid steering mode was accepted")
+	}
+	if got, _ := harness.GetSteeringMode(ctx); got != QueueOneAtATime {
+		t.Fatalf("invalid setter changed steering mode = %q", got)
+	}
+	if err := harness.SetCompactionSettings(ctx, CompactionSettings{ReserveTokens: -1}); err == nil {
+		t.Fatal("invalid compaction settings were accepted")
+	}
+}
+
+func TestHarnessOneAtATimeSteerSurvivesReopen(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemorySessionRepo(SessionCodecOptions{})
+	session, err := repo.Create(ctx, SessionCreateOptions{ID: t.Name()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	models := &scriptedModels{}
+	harness, _, err := NewHarness(ctx, AgentHarnessOptions{Session: session, Models: models, Model: Model{Provider: "provider", ModelID: "model"}, SteeringMode: QueueOneAtATime})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opID := seedRunOperation(t, session, RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationNeedAssistant}}}, nil)
+	ids := []string{session.IDGenerator().Next(), session.IDGenerator().Next()}
+	stateRegister, err := session.GetRegister(ctx, RegisterOpState, opID)
+	if err != nil || stateRegister == nil {
+		t.Fatalf("operation state = %v %+v", err, stateRegister)
+	}
+	state := stateRegister.Value.(OperationState)
+	state.Run.Settings.SteeringMode = QueueOneAtATime
+	state.Run.Inbox.Steer = append([]string(nil), ids...)
+	writes := make([]Write, 0, len(ids)+1)
+	for _, id := range ids {
+		writes = append(writes, registerSet(RegisterPendingEntry, id, PendingEntry{Type: EntryMessage, Payload: AgentMessage{Role: "user", Content: id}}))
+	}
+	writes = append(writes, registerSet(RegisterOpState, opID, state))
+	if _, err := session.Commit(ctx, Transaction{Writes: writes}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := harness.currentOperation(ctx, harness.runtimeLane)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumed, current, err := harness.consumeCheckpointInput(ctx, harness.runtimeLane, current)
+	if err != nil || !consumed || len(current.State.Run.Inbox.Steer) != 1 || current.State.Run.Inbox.Steer[0] != ids[1] {
+		t.Fatalf("one-at-a-time drain = %v %+v", err, current)
+	}
+	if current.State.Run.Phase.Checkpoint == nil || !current.State.Run.Phase.Checkpoint.SkipInboxOnce {
+		t.Fatalf("one-at-a-time drain did not set skip marker: %+v", current.State.Run.Phase)
+	}
+	if register, err := session.GetRegister(ctx, RegisterPendingEntry, ids[0]); err != nil || register != nil {
+		t.Fatalf("consumed pending register = %v %+v", err, register)
+	}
+	if register, err := session.GetRegister(ctx, RegisterPendingEntry, ids[1]); err != nil || register == nil {
+		t.Fatalf("remaining pending register = %v %+v", err, register)
+	}
+	metadata := session.Metadata()
+	if err := harness.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := repo.Open(ctx, metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, suspended, err := NewHarness(ctx, AgentHarnessOptions{Session: reopened, Models: models, Model: Model{Provider: "provider", ModelID: "model"}})
+	if err != nil || len(suspended) != 1 {
+		t.Fatalf("reopen = %v %+v", err, suspended)
+	}
+	result, err := restarted.Resume(ctx)
+	if err != nil || !result.OK || result.Value.Run == nil || result.Value.Run.Kind != "completed" {
+		t.Fatalf("reopened drain = %v %+v", err, result)
+	}
+	entries, err := reopened.FindEntries(ctx, EntryQuery{Order: OldestFirst})
+	if err != nil || len(entries) != 5 || entries[1].ID != ids[0] || entries[3].ID != ids[1] {
+		t.Fatalf("reopened one-at-a-time entries = %v %+v", err, entries)
+	}
+}
