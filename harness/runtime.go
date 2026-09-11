@@ -1023,6 +1023,401 @@ func (h *Harness) settleDeferredError(ctx context.Context, lane *runtimeLane, op
 	return h.settleGenerationErrorMessage(ctx, lane, operation, current, generation, AgentMessage{Role: "assistant", Content: cause.Error()}, terminalGenerationError{cause})
 }
 
+func (h *Harness) driveCompaction(ctx context.Context, lane *runtimeLane, operation Operation, state OperationState) (CompactionOutcome, error) {
+	current, err := h.currentOperation(ctx, lane)
+	if err != nil {
+		return CompactionOutcome{}, err
+	}
+	for {
+		compaction := current.State.Compaction
+		if compaction == nil {
+			return CompactionOutcome{}, fmt.Errorf("compaction state is missing")
+		}
+		if compaction.Control.Status == ControlCancelRequested {
+			return h.finishCompaction(ctx, lane, operation, current, nil, "aborted", nil, nil)
+		}
+		prepRegister, err := h.session.GetRegister(ctx, RegisterOpPreparation, operation.OperationID+":"+compaction.Structural.TaskID)
+		if err != nil || prepRegister == nil {
+			if err == nil {
+				err = fmt.Errorf("compaction preparation is missing")
+			}
+			return CompactionOutcome{}, err
+		}
+		prep, ok := prepRegister.Value.(DurableStructuralPreparation)
+		if !ok || prep.Kind != EntryCompaction {
+			return CompactionOutcome{}, fmt.Errorf("compaction preparation has invalid type")
+		}
+		structural := compaction.Structural
+		if structural.Status == "deciding" {
+			decision, err := h.runCompactionHook(ctx, lane, operation, prep, compaction.CustomInstructions)
+			if err != nil {
+				return h.finishCompaction(ctx, lane, operation, current, nil, "failed", &OperationError{Code: "compaction", Message: err.Error()}, nil)
+			}
+			if decision.decline {
+				return h.finishCompaction(ctx, lane, operation, current, nil, "declined", nil, nil)
+			}
+			if decision.result != nil {
+				return h.finishCompaction(ctx, lane, operation, current, decision.result, "completed", nil, nil)
+			}
+			settings := h.settings.Snapshot()
+			resultID := h.session.IDGenerator().Next()
+			generation := &SummaryGeneration{Status: GenerationReady, NextAttempt: 1, Context: SummaryContext{TaskID: structural.TaskID, ResultEntryID: resultID, Kind: EntryCompaction, Configuration: current.Configuration, StreamOptions: settings.StreamOptions, RetryPolicy: settings.RetryPolicy, Reason: "manual"}, UsageIDs: []string{}}
+			next := current.State
+			next.Run = nil
+			next.Compaction.Structural.Status = "generating"
+			next.Compaction.Structural.Generation = generation
+			var transition *CurrentOperation
+			fx := &runtimeEffects{harness: h, lane: lane}
+			if err := h.effect(ctx, ActionInfo{Kind: "transition", Description: "compaction generating"}, func(ctx context.Context) error {
+				var err error
+				transition, err = fx.CommitTransition(ctx, current, next, h.telemetry, &current.ConfigurationSeq, nil)
+				return err
+			}); err != nil {
+				if isOperationMissing(err) {
+					return CompactionOutcome{}, errOperationMissing
+				}
+				return CompactionOutcome{}, err
+			}
+			if transition == nil {
+				return CompactionOutcome{}, fmt.Errorf("compaction decision lost its compare-and-swap")
+			}
+			current = *transition
+			continue
+		}
+		if structural.Status != "generating" || structural.Generation == nil {
+			return CompactionOutcome{}, fmt.Errorf("unsupported compaction structural status %q", structural.Status)
+		}
+		generation := *structural.Generation
+		if generation.Status == GenerationRetryWait {
+			if delay := generation.NotBefore - time.Now().UnixMilli(); delay > 0 {
+				if err := h.effect(ctx, ActionInfo{Kind: "wait", Description: "compaction retry wait"}, func(ctx context.Context) error {
+					return (&runtimeEffects{harness: h, lane: lane}).Sleep(ctx, delay, h.telemetry)
+				}); err != nil {
+					return CompactionOutcome{}, err
+				}
+			}
+			next := current.State
+			next.Compaction.Structural.Generation.Status = GenerationReady
+			var transition *CurrentOperation
+			if err := h.effect(ctx, ActionInfo{Kind: "transition", Description: "compaction retry ready"}, func(ctx context.Context) error {
+				var err error
+				transition, err = (&runtimeEffects{harness: h, lane: lane}).CommitTransition(ctx, current, next, h.telemetry, nil, nil)
+				return err
+			}); err != nil {
+				return CompactionOutcome{}, err
+			}
+			if transition == nil {
+				return CompactionOutcome{}, fmt.Errorf("compaction retry transition lost its compare-and-swap")
+			}
+			current = *transition
+			continue
+		}
+		if generation.Status == GenerationEffectPending {
+			if generation.Attempt >= generation.Context.RetryPolicy.MaxAttempts {
+				return h.finishCompaction(ctx, lane, operation, current, nil, "failed", &OperationError{Code: "compaction", Message: "recovered compaction request reached retry cap"}, nil)
+			}
+			next := current.State
+			next.Compaction.Structural.Generation.Status = GenerationReady
+			next.Compaction.Structural.Generation.NextAttempt = generation.Attempt + 1
+			next.Compaction.Structural.Generation.Attempt = 0
+			next.Compaction.Structural.Generation.Request = nil
+			var transition *CurrentOperation
+			if err := h.effect(ctx, ActionInfo{Kind: "recovery", Description: "recover compaction request"}, func(ctx context.Context) error {
+				var err error
+				transition, err = (&runtimeEffects{harness: h, lane: lane}).CommitTransition(ctx, current, next, h.telemetry, nil, nil)
+				return err
+			}); err != nil {
+				return CompactionOutcome{}, err
+			}
+			if transition == nil {
+				return CompactionOutcome{}, fmt.Errorf("compaction recovery transition lost its compare-and-swap")
+			}
+			current = *transition
+			continue
+		}
+		if generation.Status != GenerationReady {
+			return CompactionOutcome{}, fmt.Errorf("unsupported compaction generation status %q", generation.Status)
+		}
+		attempt := generation.NextAttempt
+		if attempt == 0 {
+			attempt = generation.Attempt + 1
+		}
+		options := generation.Context.StreamOptions
+		options.Deferred = false
+		fx := &runtimeEffects{harness: h, lane: lane}
+		if err := h.runBeforeRequestStep(ctx, fx, operation, attempt, "compaction", fmt.Sprintf("%s:attempt:%d", generation.Context.TaskID, attempt), &options); err != nil {
+			return h.finishCompaction(ctx, lane, operation, current, nil, "failed", &OperationError{Code: "compaction", Message: err.Error()}, nil)
+		}
+		options.Deferred = false
+		usageID := h.session.IDGenerator().Next()
+		pending := current.State
+		pending.Compaction.Structural.Generation.Status = GenerationEffectPending
+		pending.Compaction.Structural.Generation.Attempt = attempt
+		pending.Compaction.Structural.Generation.NextAttempt = attempt
+		pending.Compaction.Structural.Generation.Request = &SummaryRequest{Index: len(generation.UsageIDs), UsageID: usageID}
+		var transition *CurrentOperation
+		if err := h.effect(ctx, ActionInfo{Kind: "transition", Description: "compaction request pending"}, func(ctx context.Context) error {
+			var err error
+			transition, err = fx.CommitTransition(ctx, current, pending, h.telemetry, nil, nil)
+			return err
+		}); err != nil {
+			return CompactionOutcome{}, err
+		}
+		if transition == nil {
+			return CompactionOutcome{}, fmt.Errorf("compaction request lost its compare-and-swap")
+		}
+		current = *transition
+		generation = *current.State.Compaction.Structural.Generation
+		message, err := h.runSummaryAttempt(ctx, lane, operation, prep, generation, options, fx)
+		if err != nil {
+			latest, reloadErr := h.currentOperation(ctx, lane)
+			if reloadErr == nil && latest.State.Compaction != nil && latest.State.Compaction.Control.Status == ControlCancelRequested {
+				return h.finishCompaction(ctx, lane, operation, latest, nil, "aborted", nil, nil)
+			}
+			if isOperationMissing(reloadErr) {
+				return CompactionOutcome{}, errOperationMissing
+			}
+			return h.compactionAttemptFailure(ctx, lane, operation, current, messageUsage(message), err)
+		}
+		latest, reloadErr := h.currentOperation(ctx, lane)
+		if reloadErr == nil && latest.State.Compaction != nil && latest.State.Compaction.Control.Status == ControlCancelRequested {
+			return h.finishCompaction(ctx, lane, operation, latest, nil, "aborted", nil, nil)
+		}
+		if isOperationMissing(reloadErr) {
+			return CompactionOutcome{}, errOperationMissing
+		}
+		result := &CompactResult{Summary: summaryText(message), Usage: message.Usage}
+		if prep.IsSplitTurn && generation.Request != nil && generation.Request.Index == 0 {
+			next := current.State
+			next.Compaction.Structural.Generation.Status = GenerationReady
+			next.Compaction.Structural.Generation.Request = nil
+			next.Compaction.Structural.Generation.UsageIDs = append(append([]string(nil), generation.UsageIDs...), generation.Request.UsageID)
+			writes := []Write{{Kind: WriteUsage, Usage: &UsageWrite{Row: UsageRow{ID: generation.Request.UsageID, Usage: usageValue(message.Usage)}}}, registerSet(RegisterOpState, operation.OperationID, next)}
+			if err := h.effect(ctx, ActionInfo{Kind: "settlement", Description: "compaction request settled"}, func(ctx context.Context) error {
+				return h.line(lane.name).Do(ctx, func() error {
+					valid, err := (&runtimeEffects{harness: h, lane: lane}).current(ctx, current)
+					if err != nil || !valid {
+						if err == nil {
+							err = errOperationMissing
+						}
+						return err
+					}
+					_, err = h.session.Commit(ctx, Transaction{Writes: writes})
+					return err
+				})
+			}); err != nil {
+				if isOperationMissing(err) {
+					return CompactionOutcome{}, errOperationMissing
+				}
+				return CompactionOutcome{}, err
+			}
+			current, err = h.currentOperation(ctx, lane)
+			if err != nil {
+				return CompactionOutcome{}, err
+			}
+			continue
+		}
+		return h.finishCompaction(ctx, lane, operation, current, result, "completed", nil, generation.Request)
+	}
+}
+
+type compactionDecision struct {
+	decline bool
+	result  *CompactResult
+}
+
+func (h *Harness) runCompactionHook(ctx context.Context, lane *runtimeLane, operation Operation, preparation DurableStructuralPreparation, customInstructions string) (compactionDecision, error) {
+	var result JSONValue
+	err := h.effect(ctx, ActionInfo{Kind: "hook", Description: "before_compaction"}, func(ctx context.Context) error {
+		var err error
+		result, err = h.hooks.Run(ctx, HookInvocation{Name: HookBeforeCompaction, Lane: lane.name, RunID: operation.OperationID, Event: map[string]JSONValue{"reason": "manual", "preparation": compactionPreparation(preparation), "customInstructions": customInstructions}})
+		return err
+	})
+	if err != nil {
+		return compactionDecision{}, err
+	}
+	values, _ := result.(map[string]JSONValue)
+	if values == nil {
+		return compactionDecision{}, nil
+	}
+	decision := compactionDecision{}
+	if decline, ok := values["decline"].(bool); ok {
+		decision.decline = decline
+	}
+	if supplied, ok := values["compaction"].(CompactResult); ok {
+		decision.result = &supplied
+	}
+	if decision.decline && decision.result != nil {
+		return compactionDecision{}, nil
+	}
+	return decision, nil
+}
+
+func compactionPreparation(preparation DurableStructuralPreparation) CompactionPreparation {
+	return CompactionPreparation{MessagesToSummarize: cloneValue(preparation.MessagesToSummarize).([]AgentMessage), TurnPrefixMessages: cloneValue(preparation.TurnPrefixMessages).([]AgentMessage), RetainedTail: cloneValue(preparation.RetainedTail).([]AgentMessage), IsSplitTurn: preparation.IsSplitTurn, TokensBefore: preparation.TokensBefore, PreviousSummary: preparation.PreviousSummary, Settings: preparation.Settings}
+}
+
+func (h *Harness) runSummaryAttempt(ctx context.Context, lane *runtimeLane, operation Operation, preparation DurableStructuralPreparation, generation SummaryGeneration, options AgentHarnessStreamOptions, fx *runtimeEffects) (AgentMessage, error) {
+	if err := h.effect(ctx, ActionInfo{Kind: "hook", Description: "before_payload"}, func(ctx context.Context) error {
+		_, err := fx.Run(ctx, EffectPlan{Kind: EffectHook, Key: EffectKey(fmt.Sprintf("%s:summary:%d:before_payload", operation.OperationID, generation.Attempt)), HookName: HookBeforePayload, Event: map[string]JSONValue{"model": generation.Context.Configuration.Model, "payload": JSONValue("summary-request"), "step": "compaction"}})
+		return err
+	}); err != nil {
+		return AgentMessage{}, err
+	}
+	messages := append([]Message(nil), preparation.MessagesToSummarize...)
+	var output EffectOutput
+	err := h.effect(ctx, ActionInfo{Kind: "provider", Description: "compaction summary"}, func(ctx context.Context) error {
+		var err error
+		output, err = fx.Run(ctx, EffectPlan{Kind: EffectSummary, Key: EffectKey(fmt.Sprintf("%s:summary:%d", operation.OperationID, generation.Attempt)), Summary: &generation, Model: generation.Context.Configuration.Model, Messages: messages, StreamOptions: options})
+		return err
+	})
+	if err != nil {
+		return AgentMessage{}, err
+	}
+	if output.Message == nil {
+		return AgentMessage{}, fmt.Errorf("summary provider returned no message")
+	}
+	message := *output.Message
+	if err := h.effect(ctx, ActionInfo{Kind: "hook", Description: "after_response"}, func(ctx context.Context) error {
+		result, err := fx.Run(ctx, EffectPlan{Kind: EffectHook, Key: EffectKey(fmt.Sprintf("%s:summary:%d:after_response", operation.OperationID, generation.Attempt)), HookName: HookAfterResponse, Event: map[string]JSONValue{"message": message, "step": "compaction"}})
+		if values, ok := result.Result.(map[string]JSONValue); ok {
+			if replacement, ok := values["message"].(AgentMessage); ok {
+				message = replacement
+			}
+		}
+		return err
+	}); err != nil {
+		return AgentMessage{}, err
+	}
+	if message.Role == "" {
+		message.Role = "assistant"
+	}
+	if message.StopReason == "" {
+		message.StopReason = StopReasonStop
+	}
+	if message.StopReason != StopReasonStop && message.StopReason != StopReasonLength {
+		return AgentMessage{}, fmt.Errorf("summary provider returned stop reason %q", message.StopReason)
+	}
+	return message, nil
+}
+
+func summaryText(message AgentMessage) string {
+	if text, ok := message.Content.(string); ok {
+		return text
+	}
+	return fmt.Sprint(message.Content)
+}
+
+func messageUsage(message AgentMessage) *Usage {
+	return message.Usage
+}
+
+func (h *Harness) compactionAttemptFailure(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation, usage *Usage, cause error) (CompactionOutcome, error) {
+	gen := current.State.Compaction.Structural.Generation
+	if gen == nil || gen.Request == nil {
+		return CompactionOutcome{}, fmt.Errorf("compaction request is missing")
+	}
+	if gen.Attempt < gen.Context.RetryPolicy.MaxAttempts {
+		next := current.State
+		next.Compaction.Structural.Generation.Status = GenerationRetryWait
+		next.Compaction.Structural.Generation.NextAttempt = gen.Attempt + 1
+		next.Compaction.Structural.Generation.Request = nil
+		next.Compaction.Structural.Generation.UsageIDs = append(append([]string(nil), gen.UsageIDs...), gen.Request.UsageID)
+		if gen.Context.RetryPolicy.BaseDelayMs > 0 {
+			next.Compaction.Structural.Generation.NotBefore = retryNotBefore(time.Now().UnixMilli(), gen.Context.RetryPolicy.BaseDelayMs)
+		}
+		writes := []Write{{Kind: WriteUsage, Usage: &UsageWrite{Row: UsageRow{ID: gen.Request.UsageID, Usage: usageValue(usage)}}}, registerSet(RegisterOpState, operation.OperationID, next)}
+		if err := h.effect(ctx, ActionInfo{Kind: "settlement", Description: "compaction retry"}, func(ctx context.Context) error {
+			return h.line(lane.name).Do(ctx, func() error { _, err := h.session.Commit(ctx, Transaction{Writes: writes}); return err })
+		}); err != nil {
+			return CompactionOutcome{}, err
+		}
+		current.State = next
+		return h.driveCompaction(ctx, lane, operation, next)
+	}
+	return h.finishCompaction(ctx, lane, operation, current, nil, "failed", &OperationError{Code: "compaction", Message: cause.Error()}, &SummaryRequest{UsageID: gen.Request.UsageID})
+}
+
+func usageValue(usage *Usage) Usage {
+	if usage == nil {
+		return Usage{}
+	}
+	return *usage
+}
+
+func (h *Harness) finishCompaction(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation, result *CompactResult, kind string, errorValue *OperationError, request *SummaryRequest) (CompactionOutcome, error) {
+	leaf := current.LeafID
+	var entry *Entry
+	writes := make([]Write, 0, 12)
+	if result != nil {
+		if result.Summary == "" {
+			return CompactionOutcome{}, fmt.Errorf("compaction result has no summary")
+		}
+		prepRegister, err := h.session.GetRegister(ctx, RegisterOpPreparation, current.Operation.OperationID+":"+current.State.Compaction.Structural.TaskID)
+		if err != nil || prepRegister == nil {
+			return CompactionOutcome{}, fmt.Errorf("compaction preparation is missing")
+		}
+		prep := prepRegister.Value.(DurableStructuralPreparation)
+		id := ""
+		if current.State.Compaction.Structural.Generation != nil {
+			id = current.State.Compaction.Structural.Generation.Context.ResultEntryID
+		}
+		if id == "" {
+			id = h.session.IDGenerator().Next()
+		}
+		built := &Entry{EntryBase: EntryBase{ID: id, ParentID: cloneStringPointer(current.LeafID), Type: EntryCompaction}, Summary: result.Summary, RetainedTail: cloneValue(prep.RetainedTail).([]AgentMessage), TokensBefore: prep.TokensBefore, Usage: result.Usage, FromHook: request == nil}
+		entry = built
+		writes = append(writes, Write{Kind: WriteEntry, Entry: &EntryWrite{Entry: *built}}, registerSet(RegisterLaneLeaf, lane.name, stringPointer(id)))
+		leaf = stringPointer(id)
+		if request != nil {
+			writes = append(writes, Write{Kind: WriteUsage, Usage: &UsageWrite{Row: UsageRow{ID: request.UsageID, Usage: usageValue(result.Usage), EntryID: stringPointer(id)}}})
+		} else if result.Usage != nil {
+			writes = append(writes, Write{Kind: WriteUsage, Usage: &UsageWrite{Row: UsageRow{ID: h.session.IDGenerator().Next(), Usage: *result.Usage, EntryID: stringPointer(id)}}})
+		}
+	} else if request != nil && request.UsageID != "" {
+		writes = append(writes, Write{Kind: WriteUsage, Usage: &UsageWrite{Row: UsageRow{ID: request.UsageID, Usage: Usage{}}}})
+	}
+	cleanup, err := h.operationCleanupWrites(ctx, operation.OperationID, current.State)
+	if err != nil {
+		return CompactionOutcome{}, err
+	}
+	writes = append(writes, cleanup...)
+	writes = append(writes, registerSet(RegisterLaneLastResult, lane.name, LaneLastResult{OperationID: operation.OperationID, Kind: OperationCompaction, Outcome: kind, LeafID: leaf, Error: errorValue}))
+	laneState := current.LaneState
+	laneState.CurrentOperationID = nil
+	writes = append(writes, registerSet(RegisterLaneState, lane.name, laneState))
+	if err := h.effect(ctx, ActionInfo{Kind: "terminal", Description: "compaction terminal"}, func(ctx context.Context) error {
+		return h.line(lane.name).Do(ctx, func() error {
+			if register, err := h.session.GetRegister(ctx, RegisterLaneState, lane.name); err != nil {
+				return err
+			} else if register != nil {
+				if latest, ok := register.Value.(LaneState); ok {
+					latest.CurrentOperationID = nil
+					writes[len(writes)-1] = registerSet(RegisterLaneState, lane.name, latest)
+				}
+			}
+			valid, err := (&runtimeEffects{harness: h, lane: lane}).current(ctx, current)
+			if err != nil || !valid {
+				if err == nil {
+					err = errOperationMissing
+				}
+				return err
+			}
+			_, err = h.session.Commit(ctx, Transaction{Writes: writes})
+			return err
+		})
+	}); err != nil {
+		if isOperationMissing(err) {
+			return CompactionOutcome{}, errOperationMissing
+		}
+		return CompactionOutcome{}, err
+	}
+	lane.finish()
+	outcome := CompactionOutcome{Kind: kind, LeafID: leaf, Entry: entry, Error: errorValue}
+	h.events.Emit(ctx, HarnessEvent{Type: string(EventCompactionEnd), Lane: lane.name, Payload: cloneValue(outcome)})
+	return outcome, nil
+}
+
 func (h *Harness) runDeferredPoll(ctx context.Context, lane *runtimeLane, operation Operation, deferred Deferred, handle DeferredHandle, options AgentHarnessStreamOptions, fx *runtimeEffects, turnID string) (DeferredResponse, error) {
 	if err := h.effect(ctx, ActionInfo{Kind: "hook", Description: "before_payload"}, func(ctx context.Context) error {
 		_, err := fx.Run(ctx, EffectPlan{Kind: EffectHook, Key: EffectKey(fmt.Sprintf("%s:deferred:%d:before_payload", operation.OperationID, deferred.Poll)), HookName: HookBeforePayload, Event: map[string]JSONValue{"model": deferred.Configuration.Model, "payload": JSONValue("provider-request"), "turnId": turnID, "deferred": true}})
@@ -2201,6 +2596,30 @@ func (e *runtimeEffects) Run(ctx context.Context, plan EffectPlan) (EffectOutput
 		}
 		response, err := e.harness.models.FetchDeferred(effectCtx, plan.Model, *plan.Handle, plan.StreamOptions)
 		return EffectOutput{Kind: "deferred", Key: plan.Key, Deferred: &response}, err
+	case EffectSummary:
+		effectCtx, stop := e.lane.cancellableEffectContext(ctx)
+		defer stop()
+		if _, err := e.harness.models.Resolve(effectCtx, plan.Model.Provider, plan.Model.ModelID); err != nil {
+			return EffectOutput{}, err
+		}
+		stream, err := e.harness.models.Stream(effectCtx, plan.Model, plan.Messages, plan.StreamOptions)
+		if err != nil {
+			return EffectOutput{}, err
+		}
+		if stream == nil {
+			return EffectOutput{}, fmt.Errorf("summary provider returned a nil stream")
+		}
+		var message *AgentMessage
+		for event := range stream {
+			if event.Message != nil {
+				copy := *event.Message
+				message = &copy
+			}
+		}
+		if message == nil {
+			return EffectOutput{}, fmt.Errorf("summary provider returned no message")
+		}
+		return EffectOutput{Kind: "summary", Key: plan.Key, Message: message}, nil
 	case EffectTool:
 		effectCtx, stop := e.lane.cancellableEffectContext(ctx)
 		defer stop()
@@ -2365,8 +2784,102 @@ func (l *runtimeLane) Skill(context.Context, string, string) (Result[RunOutcome,
 func (l *runtimeLane) PromptFromTemplate(context.Context, string, []string) (Result[RunOutcome, error], error) {
 	return Err[RunOutcome](fmt.Errorf("prompt template is not implemented")), nil
 }
-func (l *runtimeLane) Compact(context.Context, string) (Result[CompactionOutcome, error], error) {
-	return Err[CompactionOutcome](fmt.Errorf("compaction is not implemented")), nil
+func (l *runtimeLane) Compact(ctx context.Context, customInstructions string) (Result[CompactionOutcome, error], error) {
+	if err := l.harness.lifecycle.Err(); err != nil {
+		return Result[CompactionOutcome, error]{Err: err}, nil
+	}
+	var operation Operation
+	var state OperationState
+	var accepted bool
+	err := l.harness.line(l.name).Do(ctx, func() error {
+		laneStateRegister, err := l.harness.session.GetRegister(ctx, RegisterLaneState, l.name)
+		if err != nil || laneStateRegister == nil {
+			return err
+		}
+		laneState, ok := laneStateRegister.Value.(LaneState)
+		if !ok {
+			return fmt.Errorf("lane state has invalid type")
+		}
+		if laneState.CurrentOperationID != nil {
+			kind := OperationRun
+			if register, err := l.harness.session.GetRegister(ctx, RegisterOpMeta, *laneState.CurrentOperationID); err == nil && register != nil {
+				if operation, ok := register.Value.(Operation); ok {
+					kind = operation.Intent.Kind
+				}
+			}
+			return &LaneBusy{TaggedError: TaggedError{Message: "lane is busy"}, Lane: l.name, OperationID: *laneState.CurrentOperationID, OperationKind: kind}
+		}
+		leafRegister, err := l.harness.session.GetRegister(ctx, RegisterLaneLeaf, l.name)
+		if err != nil {
+			return err
+		}
+		var leaf *string
+		if leafRegister != nil {
+			leaf, ok = leafRegister.Value.(*string)
+			if !ok {
+				return fmt.Errorf("lane leaf has invalid type")
+			}
+		}
+		if leaf == nil {
+			return &NothingToCompact{TaggedError: TaggedError{Message: "nothing to compact"}, Lane: l.name}
+		}
+		entries, err := l.view.FindEntriesOnBranch(ctx, BranchScan{Start: *leaf, Order: OldestFirst})
+		if err != nil {
+			return err
+		}
+		messages := make([]AgentMessage, 0, len(entries))
+		previousSummary := ""
+		for _, entry := range entries {
+			if entry.Type == EntryCompaction {
+				messages = nil
+				previousSummary = entry.Summary
+				continue
+			}
+			if entry.Message != nil && includeInContext(*entry.Message) {
+				messages = append(messages, *messageCopy(*entry.Message))
+			}
+		}
+		if len(messages) < 2 {
+			return &NothingToCompact{TaggedError: TaggedError{Message: "nothing to compact"}, Lane: l.name}
+		}
+		retained := []AgentMessage{messages[len(messages)-1]}
+		toSummarize := append([]AgentMessage(nil), messages[:len(messages)-1]...)
+		settings, err := l.harness.GetCompactionSettings(ctx)
+		if err != nil {
+			return err
+		}
+		configRegister, err := l.harness.session.GetRegister(ctx, RegisterLaneConfig, l.name)
+		if err != nil || configRegister == nil {
+			return err
+		}
+		config, ok := configRegister.Value.(LaneConfiguration)
+		if !ok {
+			return fmt.Errorf("lane configuration has invalid type")
+		}
+		operationID := l.harness.session.IDGenerator().Next()
+		taskID := "task:1"
+		prep := DurableStructuralPreparation{Kind: EntryCompaction, MessagesToSummarize: toSummarize, RetainedTail: retained, TokensBefore: int64(len(messages)), PreviousSummary: previousSummary, Settings: settings}
+		operation = Operation{OperationID: operationID, Lane: l.name, SourceLeafID: cloneStringPointer(leaf), StartedAt: time.Now().UnixMilli(), Intent: OperationIntent{Kind: OperationCompaction, CustomInstructions: customInstructions}}
+		state = OperationState{Kind: OperationCompaction, Compaction: &CompactionState{Kind: OperationCompaction, Control: Control{Status: ControlRunning}, CustomInstructions: customInstructions, Structural: StructuralDecision{TaskID: taskID, Status: "deciding"}}}
+		laneState.CurrentOperationID = &operationID
+		_, err = l.harness.session.Commit(ctx, Transaction{Writes: []Write{registerSet(RegisterOpMeta, operationID, operation), registerSet(RegisterOpPreparation, operationID+":"+taskID, prep), registerSet(RegisterOpState, operationID, state), registerSet(RegisterLaneState, l.name, laneState)}})
+		accepted = err == nil
+		_ = config
+		return err
+	})
+	if err != nil {
+		return Result[CompactionOutcome, error]{Err: err}, nil
+	}
+	if !accepted {
+		return Result[CompactionOutcome, error]{Err: fmt.Errorf("compaction was not accepted")}, nil
+	}
+	l.begin()
+	l.harness.events.Emit(ctx, HarnessEvent{Type: string(EventCompactionStart), Lane: l.name, Payload: map[string]JSONValue{"runId": operation.OperationID}})
+	outcome, err := l.harness.driveCompaction(ctx, l, operation, state)
+	if err != nil {
+		return Result[CompactionOutcome, error]{Err: err}, nil
+	}
+	return Ok[CompactionOutcome, error](outcome), nil
 }
 func (l *runtimeLane) NavigateTree(context.Context, *string, NavigateOptions) (Result[NavigationOutcome, error], error) {
 	return Err[NavigationOutcome](fmt.Errorf("navigation is not implemented")), nil
@@ -2383,6 +2896,22 @@ func (l *runtimeLane) Resume(ctx context.Context) (Result[ResumeOutcome, error],
 		return Result[ResumeOutcome, error]{Err: &NothingToResume{TaggedError: TaggedError{Message: "nothing to resume"}, Lane: l.name}}, nil
 	}
 	current := *restored.Current
+	if current.Operation.Intent.Kind == OperationCompaction && current.State.Compaction != nil {
+		if missing := l.missingIdentities(ctx, current.Configuration); missing != nil {
+			return Result[ResumeOutcome, error]{Err: missing}, nil
+		}
+		if err := l.harness.line(l.name).Do(ctx, func() error {
+			l.begin()
+			return nil
+		}); err != nil {
+			return Result[ResumeOutcome, error]{Err: err}, nil
+		}
+		outcome, err := l.harness.driveCompaction(ctx, l, current.Operation, current.State)
+		if err != nil {
+			return Result[ResumeOutcome, error]{Err: err}, nil
+		}
+		return Ok[ResumeOutcome, error](ResumeOutcome{Operation: OperationCompaction, RunID: current.Operation.OperationID, Compaction: &outcome}), nil
+	}
 	if current.Operation.Intent.Kind != OperationRun || current.State.Run == nil {
 		return Result[ResumeOutcome, error]{Err: fmt.Errorf("resume for %s is not implemented", current.Operation.Intent.Kind)}, nil
 	}
@@ -2438,6 +2967,22 @@ func (l *runtimeLane) Abort(ctx context.Context) (Result[AbortOutcome, error], e
 				return &NoActiveOperation{TaggedError: TaggedError{Message: "no active operation"}, Lane: l.name}
 			}
 			return err
+		}
+		if current.State.Run == nil {
+			if current.State.Compaction == nil {
+				return &NoActiveOperation{TaggedError: TaggedError{Message: "operation is not a run"}, Lane: l.name}
+			}
+			compaction := current.State.Compaction
+			if compaction.Control.Status == ControlRunning {
+				compaction.Control.Status = ControlCancelRequested
+				compaction.Control.RequestedAt = time.Now().UnixMilli()
+				if _, err := l.harness.session.Commit(ctx, Transaction{Writes: []Write{registerSet(RegisterOpState, current.Operation.OperationID, current.State)}}); err != nil {
+					return err
+				}
+				shouldSignal = true
+			}
+			outcome.RunID = current.Operation.OperationID
+			return nil
 		}
 		if current.State.Run == nil {
 			return &NoActiveOperation{TaggedError: TaggedError{Message: "operation is not a run"}, Lane: l.name}
