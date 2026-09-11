@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestRestoreValidatesIdleAndOpenLaneInventory(t *testing.T) {
@@ -12,6 +13,9 @@ func TestRestoreValidatesIdleAndOpenLaneInventory(t *testing.T) {
 	repo := NewMemorySessionRepo(SessionCodecOptions{})
 	session, err := repo.Create(ctx, SessionCreateOptions{ID: "session"})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.(*MemorySession).SetLaneConfiguration(ctx, "main", LaneConfiguration{Model: Model{Provider: "provider", ModelID: "model"}, ThinkingLevel: ThinkingLow, ActiveToolNames: []string{}}); err != nil {
 		t.Fatal(err)
 	}
 	id, err := session.AppendMessage(ctx, AgentMessage{Role: "user", Content: "restore"})
@@ -77,8 +81,16 @@ func TestManualSchedulerAndRuntimePrimitives(t *testing.T) {
 		t.Fatal(err)
 	}
 	values, err := hooks.Run(ctx, HookInvocation{Name: HookBeforeRun})
-	if err != nil || !reflect.DeepEqual(order, []string{"a", "b"}) || len(values) != 2 {
+	if err != nil || !reflect.DeepEqual(order, []string{"b", "a"}) || !reflect.DeepEqual(values, "a") {
 		t.Fatalf("hook aggregation/order failed: %v %v %v", err, order, values)
+	}
+	values, err = hooks.Run(ctx, HookInvocation{Name: HookBeforeRun, Event: map[string]JSONValue{"messages": []AgentMessage{{Role: "user", Content: "one"}}}})
+	if err != nil || values != "a" {
+		t.Fatalf("hook result aggregation failed: %v %v", err, values)
+	}
+	bus.Emit(ctx, HarnessEvent{Type: "buffered", Payload: map[string]JSONValue{"value": "kept"}})
+	if buffered := bus.Drain(); len(buffered) != 3 || buffered[2].Type != "buffered" {
+		t.Fatalf("event buffering failed: %+v", buffered)
 	}
 	settings := NewSettingsSnapshot(AgentHarnessStreamOptions{}, NormalizedRetryPolicy{MaxAttempts: 1})
 	updated := settings.Update(AgentHarnessStreamOptions{TimeoutMs: 10}, NormalizedRetryPolicy{MaxAttempts: 2})
@@ -89,4 +101,86 @@ func TestManualSchedulerAndRuntimePrimitives(t *testing.T) {
 	wg.Add(1)
 	go func() { defer wg.Done(); scheduler.Close() }()
 	wg.Wait()
+}
+
+func TestLaneMutationCASAndNestedManualGate(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemorySessionRepo(SessionCodecOptions{})
+	session, err := repo.Create(ctx, SessionCreateOptions{ID: "session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := session.GetRegister(ctx, RegisterLaneState, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := &LaneMutationLine{}
+	ok, err := line.Commit(ctx, session, []RegisterToken{{Namespace: RegisterLaneState, Key: "main", Seq: state.Seq, Exists: true}}, Transaction{Writes: []Write{registerSet(RegisterLaneState, "main", LaneState{PendingNextRun: []string{"queued"}})}})
+	if err != nil || !ok {
+		t.Fatalf("expected CAS commit: %v %v", err, ok)
+	}
+	ok, err = line.Commit(ctx, session, []RegisterToken{{Namespace: RegisterLaneState, Key: "main", Seq: state.Seq, Exists: true}}, Transaction{Writes: []Write{registerSet(RegisterLaneState, "main", LaneState{PendingNextRun: []string{"stale"}})}})
+	if err != nil || ok {
+		t.Fatalf("stale CAS committed: %v %v", err, ok)
+	}
+
+	scheduler := NewManualScheduler(true)
+	parentStarted := make(chan struct{})
+	parentDone := make(chan struct{})
+	childDone, err := scheduler.Enqueue(ctx, ScheduledAction{Info: ActionInfo{Kind: "parent"}, Run: func(context.Context) error {
+		close(parentStarted)
+		done, err := scheduler.Enqueue(ctx, ScheduledAction{Info: ActionInfo{Kind: "child"}, Run: func(context.Context) error { close(parentDone); return nil }})
+		if err != nil {
+			return err
+		}
+		return <-done
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scheduler.Execute(ctx); err != nil {
+		t.Fatal(err)
+	}
+	<-parentStarted
+	if info := scheduler.Peek(); info == nil || info.Kind != "child" {
+		t.Fatalf("nested action was not parked: %+v", info)
+	}
+	if _, err := scheduler.Execute(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-childDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-parentDone:
+	case <-time.After(time.Second):
+		t.Fatal("nested manual action did not complete parent")
+	}
+}
+
+func TestRestoreAcceptsUnmaterializedReservedResponse(t *testing.T) {
+	ctx := context.Background()
+	repo := NewMemorySessionRepo(SessionCodecOptions{})
+	session, err := repo.Create(ctx, SessionCreateOptions{ID: "session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := LaneConfiguration{Model: Model{Provider: "provider", ModelID: "model"}, ThinkingLevel: ThinkingLow, ActiveToolNames: []string{}}
+	if err := session.(*MemorySession).SetLaneConfiguration(ctx, "main", config); err != nil {
+		t.Fatal(err)
+	}
+	prompt, err := session.AppendMessage(ctx, AgentMessage{Role: "user", Content: "prompt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opID := "operation"
+	state := OperationState{Kind: OperationRun, Run: &RunState{Kind: OperationRun, Control: Control{Status: ControlRunning}, Phase: RunPhase{Kind: PhaseAssistant, Generation: &Generation{Status: GenerationEffectPending, ResponseEntryID: "reserved-response", Context: GenerationContext{StepID: "step", TriggerEntryID: prompt, Configuration: config}}}, Inbox: Inbox{}}}
+	operation := Operation{OperationID: opID, Lane: "main", SourceLeafID: stringPointer(prompt), Intent: OperationIntent{Kind: OperationRun, PromptEntryIDs: []string{prompt}}}
+	if _, err := session.Commit(ctx, Transaction{Writes: []Write{registerSet(RegisterOpMeta, opID, operation), registerSet(RegisterOpState, opID, state), registerSet(RegisterLaneState, "main", LaneState{CurrentOperationID: &opID, PendingNextRun: []string{}})}}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Restore(ctx, session, "main")
+	if err != nil || result.Current == nil {
+		t.Fatalf("restore rejected unmaterialized reservation: %v %+v", err, result)
+	}
 }

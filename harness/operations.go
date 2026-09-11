@@ -195,6 +195,7 @@ type Generation struct {
 type ToolBatch struct {
 	AssistantEntryID string            `json:"assistantEntryId"`
 	Configuration    LaneConfiguration `json:"configuration"`
+	StepID           string            `json:"stepId,omitempty"`
 	TurnID           string            `json:"turnId"`
 	Calls            []ToolCall        `json:"calls"`
 }
