@@ -60,6 +60,8 @@ type EffectPlan struct {
 	HookName         HookName
 	Event            JSONValue
 	StreamOptions    AgentHarnessStreamOptions
+	Model            Model
+	Messages         []Message
 }
 
 type EffectOutput struct {
@@ -750,6 +752,22 @@ func (s *SettingsSnapshot) Update(stream AgentHarnessStreamOptions, retry Normal
 	return RuntimeSnapshot{SettingsRevision: s.revision, StreamOptions: cloneValue(s.stream).(AgentHarnessStreamOptions), RetryPolicy: s.retry}
 }
 
+func (s *SettingsSnapshot) UpdateStream(stream AgentHarnessStreamOptions) RuntimeSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.revision++
+	s.stream = cloneValue(stream).(AgentHarnessStreamOptions)
+	return RuntimeSnapshot{SettingsRevision: s.revision, StreamOptions: cloneValue(s.stream).(AgentHarnessStreamOptions), RetryPolicy: s.retry}
+}
+
+func (s *SettingsSnapshot) UpdateRetry(retry NormalizedRetryPolicy) RuntimeSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.revision++
+	s.retry = retry
+	return RuntimeSnapshot{SettingsRevision: s.revision, StreamOptions: cloneValue(s.stream).(AgentHarnessStreamOptions), RetryPolicy: s.retry}
+}
+
 type ScheduledAction struct {
 	Info ActionInfo
 	Run  func(context.Context) error
@@ -958,6 +976,12 @@ type hookRegistration struct {
 
 func NewHookRunner() *HookRunner {
 	return &HookRunner{handlers: make(map[HookName][]hookRegistration)}
+}
+
+func (r *HookRunner) Has(name HookName) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.handlers[name]) != 0
 }
 
 func (r *HookRunner) On(name HookName, handler HookHandler, id string) (func(), error) {
