@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -621,21 +622,7 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 			return h.driveTools(ctx, lane, operation, current)
 		}
 		if phase.Kind == PhaseDeferred {
-			if phase.Deferred == nil || phase.Deferred.Status != DeferredSuspended {
-				return RunOutcome{}, fmt.Errorf("deferred state is not resumable")
-			}
-			entry, err := lane.view.GetEntry(ctx, phase.Deferred.SourceEntryID)
-			if err != nil || entry == nil || entry.Message == nil {
-				if err == nil {
-					err = fmt.Errorf("deferred source entry is missing")
-				}
-				return RunOutcome{}, err
-			}
-			handle, ok := deferredHandle(*entry.Message)
-			if !ok {
-				return RunOutcome{}, fmt.Errorf("deferred source entry has no valid handle")
-			}
-			return RunOutcome{Kind: "suspended", RunID: operation.OperationID, LeafID: stringPointer(phase.Deferred.SourceEntryID), FinalEntryID: stringPointer(phase.Deferred.SourceEntryID), FinalMessage: messageCopy(*entry.Message), Reason: "deferred", Deferred: handle}, nil
+			return h.driveDeferred(ctx, lane, operation, current)
 		}
 		if phase.Kind == PhaseCheckpoint {
 			if phase.Checkpoint == nil {
@@ -854,6 +841,226 @@ func (h *Harness) drive(ctx context.Context, lane *runtimeLane, operation Operat
 	}
 }
 
+func (h *Harness) driveDeferred(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation) (RunOutcome, error) {
+	run := current.State.Run
+	if run == nil || run.Phase.Deferred == nil {
+		return RunOutcome{}, fmt.Errorf("deferred state is missing")
+	}
+	deferred := *run.Phase.Deferred
+	if deferred.SourceEntryID == "" {
+		return RunOutcome{}, fmt.Errorf("deferred state has no source entry")
+	}
+	entry, err := lane.view.GetEntry(ctx, deferred.SourceEntryID)
+	if err != nil || entry == nil || entry.Message == nil {
+		if err == nil {
+			err = fmt.Errorf("deferred source entry is missing")
+		}
+		return RunOutcome{}, err
+	}
+	handle, ok := deferredHandle(*entry.Message)
+	if !ok {
+		return RunOutcome{}, fmt.Errorf("deferred source entry has no valid handle")
+	}
+
+	poll := deferred.Poll
+	if deferred.Status == DeferredSuspended {
+		poll++
+	} else if deferred.Status != DeferredEffectPending {
+		return RunOutcome{}, fmt.Errorf("unsupported deferred status %q", deferred.Status)
+	}
+	if poll < 1 {
+		poll = 1
+	}
+	requestOptions := cloneValue(deferred.StreamOptions).(AgentHarnessStreamOptions)
+	requestOptions.Deferred = false
+	fx := &runtimeEffects{harness: h, lane: lane}
+	turnID := fmt.Sprintf("%s:poll:%d", deferred.StepID, poll)
+	if err := h.runBeforeRequestStep(ctx, fx, operation, poll, "deferred", turnID, &requestOptions); err != nil {
+		return h.finishFailure(ctx, lane, operation, current, err)
+	}
+	requestOptions.Deferred = false
+	responseID, usageID := h.session.IDGenerator().Next(), h.session.IDGenerator().Next()
+	pendingDeferred := deferred
+	pendingDeferred.Status = DeferredEffectPending
+	pendingDeferred.Poll = poll
+	pendingDeferred.ResponseEntryID = responseID
+	pendingDeferred.UsageID = usageID
+	generation := deferredGeneration(pendingDeferred, responseID, usageID)
+	pending := current.State
+	pending.Run.Phase = RunPhase{Kind: PhaseDeferred, Deferred: &pendingDeferred}
+	var transition *CurrentOperation
+	if err := h.effect(ctx, ActionInfo{Kind: "transition", Description: "deferred effect pending"}, func(ctx context.Context) error {
+		var err error
+		transition, err = fx.CommitTransition(ctx, current, pending, h.telemetry, nil, nil)
+		return err
+	}); err != nil {
+		if isOperationMissing(err) {
+			return h.resolveExternalFinalization(ctx, lane, operation)
+		}
+		return RunOutcome{}, err
+	}
+	if transition == nil {
+		return RunOutcome{}, fmt.Errorf("deferred intent lost its compare-and-swap")
+	}
+	current = *transition
+
+	response, err := h.runDeferredPoll(ctx, lane, operation, pendingDeferred, *handle, requestOptions, fx, turnID)
+	if err != nil {
+		latest, reloadErr := h.currentOperation(ctx, lane)
+		if reloadErr == nil && latest.State.Run != nil && latest.State.Run.Control.Status == ControlCancelRequested {
+			h.cancelDeferredSource(ctx, lane, pendingDeferred)
+			return h.settleAborted(ctx, lane, operation, latest, generation, AgentMessage{Role: "assistant", Content: "deferred request aborted"})
+		}
+		if isOperationMissing(reloadErr) {
+			return h.resolveExternalFinalization(ctx, lane, operation)
+		}
+		return h.settleDeferredError(ctx, lane, operation, current, generation, err)
+	}
+	latest, reloadErr := h.currentOperation(ctx, lane)
+	if reloadErr == nil && latest.State.Run != nil && latest.State.Run.Control.Status == ControlCancelRequested {
+		h.cancelDeferredSource(ctx, lane, pendingDeferred)
+		message := AgentMessage{Role: "assistant", Content: "deferred request aborted"}
+		if response.Message != nil {
+			message = *response.Message
+		}
+		return h.settleAborted(ctx, lane, operation, latest, generation, message)
+	}
+	if isOperationMissing(reloadErr) {
+		return h.resolveExternalFinalization(ctx, lane, operation)
+	}
+
+	if response.Kind == "pending" {
+		if response.Handle == nil && response.Message != nil {
+			response.Handle, _ = deferredHandle(*response.Message)
+		}
+		if response.Handle == nil || !reflect.DeepEqual(*response.Handle, *handle) {
+			return h.settleDeferredError(ctx, lane, operation, current, generation, fmt.Errorf("deferred provider returned a mismatched handle"))
+		}
+		message := deferredResponseMessage(response, *handle, StopReasonDeferred)
+		next := RunPhase{Kind: PhaseDeferred, Deferred: &Deferred{Status: DeferredSuspended, StepID: deferred.StepID, SourceEntryID: responseID, Poll: poll, Configuration: deferred.Configuration, StreamOptions: deferred.StreamOptions}}
+		settled, err := h.settleGeneration(ctx, lane, operation, current, generation, message, next)
+		if err != nil {
+			return RunOutcome{}, err
+		}
+		return RunOutcome{Kind: "suspended", RunID: operation.OperationID, LeafID: settled.LeafID, FinalEntryID: settled.LeafID, FinalMessage: &message, Reason: "deferred", Deferred: response.Handle}, nil
+	}
+	if response.Kind == "error" {
+		message := response.Error
+		if message == "" {
+			message = "deferred provider returned an error"
+		}
+		return h.settleDeferredError(ctx, lane, operation, current, generation, fmt.Errorf("%s", message))
+	}
+	if response.Kind != "ready" || response.Message == nil {
+		return h.settleDeferredError(ctx, lane, operation, current, generation, fmt.Errorf("deferred provider returned invalid response"))
+	}
+	message := *response.Message
+	message.Role = "assistant"
+	if message.StopReason == "" {
+		message.StopReason = StopReasonStop
+	}
+	if err := validateAssistantMessage(message); err != nil {
+		return h.settleDeferredError(ctx, lane, operation, current, generation, err)
+	}
+	if message.StopReason == StopReasonAborted {
+		return RunOutcome{}, h.lifecycle.Fault(fmt.Errorf("provider returned aborted while control is running"))
+	}
+	if message.StopReason == StopReasonError {
+		return h.settleDeferredError(ctx, lane, operation, current, generation, fmt.Errorf("provider returned an error"))
+	}
+	if message.StopReason == StopReasonDeferred {
+		return h.settleDeferredError(ctx, lane, operation, current, generation, fmt.Errorf("ready deferred response has deferred stop reason"))
+	}
+	if message.StopReason == StopReasonToolUse && len(message.ToolCalls) == 0 {
+		return h.settleDeferredError(ctx, lane, operation, current, generation, fmt.Errorf("tool_use response has no tool calls"))
+	}
+	if len(message.ToolCalls) != 0 {
+		calls := make([]ToolCall, len(message.ToolCalls))
+		for i := range message.ToolCalls {
+			calls[i] = ToolCall{Status: "planned", SourceIndex: i, ResultEntryID: h.session.IDGenerator().Next()}
+		}
+		next := RunPhase{Kind: PhaseTools, ToolBatch: &ToolBatch{AssistantEntryID: responseID, Configuration: deferred.Configuration, StepID: deferred.StepID, TurnID: turnID, Calls: calls}}
+		settled, err := h.settleGeneration(ctx, lane, operation, current, generation, message, next)
+		if err != nil {
+			return RunOutcome{}, err
+		}
+		return h.driveTools(ctx, lane, operation, settled)
+	}
+	next := RunPhase{Kind: PhaseCheckpoint, Checkpoint: &CheckpointPhase{Continuation: Continuation{Kind: ContinuationMayFinish, IncludeFinalAssistant: true}, TriggerEntryID: responseID}}
+	settled, err := h.settleGeneration(ctx, lane, operation, current, generation, message, next)
+	if err != nil {
+		return RunOutcome{}, err
+	}
+	return h.drive(ctx, lane, operation, settled.State)
+}
+
+func deferredGeneration(deferred Deferred, responseID, usageID string) Generation {
+	return Generation{Status: GenerationEffectPending, Context: GenerationContext{StepID: deferred.StepID, TriggerEntryID: deferred.SourceEntryID, Configuration: deferred.Configuration, StreamOptions: deferred.StreamOptions, RetryPolicy: NormalizedRetryPolicy{MaxAttempts: 1}}, Attempt: deferred.Poll, NextAttempt: deferred.Poll, ResponseEntryID: responseID, UsageID: usageID}
+}
+
+func deferredResponseMessage(response DeferredResponse, handle DeferredHandle, reason StopReason) AgentMessage {
+	if response.Message != nil {
+		message := *response.Message
+		message.Role = "assistant"
+		message.StopReason = reason
+		if message.Metadata == nil {
+			message.Metadata = make(map[string]JSONValue)
+		}
+		message.Metadata["deferred"] = cloneValue(handle)
+		return message
+	}
+	content := JSONValue(handle)
+	if response.Error != "" {
+		content = response.Error
+	}
+	return AgentMessage{Role: "assistant", Content: content, StopReason: reason}
+}
+
+func (h *Harness) settleDeferredError(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation, generation Generation, cause error) (RunOutcome, error) {
+	if cause == nil {
+		cause = fmt.Errorf("deferred request failed")
+	}
+	return h.settleGenerationErrorMessage(ctx, lane, operation, current, generation, AgentMessage{Role: "assistant", Content: cause.Error()}, terminalGenerationError{cause})
+}
+
+func (h *Harness) runDeferredPoll(ctx context.Context, lane *runtimeLane, operation Operation, deferred Deferred, handle DeferredHandle, options AgentHarnessStreamOptions, fx *runtimeEffects, turnID string) (DeferredResponse, error) {
+	if err := h.effect(ctx, ActionInfo{Kind: "hook", Description: "before_payload"}, func(ctx context.Context) error {
+		_, err := fx.Run(ctx, EffectPlan{Kind: EffectHook, Key: EffectKey(fmt.Sprintf("%s:deferred:%d:before_payload", operation.OperationID, deferred.Poll)), HookName: HookBeforePayload, Event: map[string]JSONValue{"model": deferred.Configuration.Model, "payload": JSONValue("provider-request"), "turnId": turnID, "deferred": true}})
+		return err
+	}); err != nil {
+		return DeferredResponse{}, terminalGenerationError{err}
+	}
+	var response DeferredResponse
+	if err := h.effect(ctx, ActionInfo{Kind: "provider", Description: "deferred poll"}, func(ctx context.Context) error {
+		output, err := fx.Run(ctx, EffectPlan{Kind: EffectDeferred, Key: EffectKey(fmt.Sprintf("%s:deferred:%d", operation.OperationID, deferred.Poll)), Deferred: &deferred, Handle: &handle, Model: deferred.Configuration.Model, StreamOptions: options})
+		if output.Deferred != nil {
+			response = *output.Deferred
+		}
+		return err
+	}); err != nil {
+		return DeferredResponse{}, err
+	}
+	if response.Kind == "" {
+		return DeferredResponse{}, fmt.Errorf("deferred provider returned no response")
+	}
+	if response.Message == nil {
+		message := deferredResponseMessage(response, handle, StopReason(response.Kind))
+		response.Message = &message
+	}
+	if err := h.effect(ctx, ActionInfo{Kind: "hook", Description: "after_response"}, func(ctx context.Context) error {
+		output, err := fx.Run(ctx, EffectPlan{Kind: EffectHook, Key: EffectKey(fmt.Sprintf("%s:deferred:%d:after_response", operation.OperationID, deferred.Poll)), HookName: HookAfterResponse, Event: map[string]JSONValue{"message": *response.Message, "turnId": turnID, "deferred": true}})
+		if values, ok := output.Result.(map[string]JSONValue); ok {
+			if replacement, ok := values["message"].(AgentMessage); ok {
+				response.Message = &replacement
+			}
+		}
+		return err
+	}); err != nil {
+		return DeferredResponse{}, terminalGenerationError{err}
+	}
+	return response, nil
+}
+
 func (h *Harness) driveFailureDrain(ctx context.Context, lane *runtimeLane, operation Operation, current CurrentOperation) (RunOutcome, error) {
 	run := current.State.Run
 	if run == nil || run.Phase.Error == nil {
@@ -911,7 +1118,12 @@ func (h *Harness) reconcileCancelled(ctx context.Context, lane *runtimeLane, ope
 		return h.settleAborted(ctx, lane, operation, current, *phase.Generation, AgentMessage{Role: "assistant", Content: "assistant request aborted"})
 	}
 	if phase.Kind == PhaseDeferred && phase.Deferred != nil {
-		h.cancelDeferredSource(ctx, lane, *phase.Deferred)
+		deferred := *phase.Deferred
+		h.cancelDeferredSource(ctx, lane, deferred)
+		if deferred.Status == DeferredEffectPending {
+			generation := deferredGeneration(deferred, deferred.ResponseEntryID, deferred.UsageID)
+			return h.settleAborted(ctx, lane, operation, current, generation, AgentMessage{Role: "assistant", Content: "deferred request aborted"})
+		}
 	}
 	if phase.Kind == PhaseTools && phase.ToolBatch != nil {
 		for index, call := range phase.ToolBatch.Calls {
@@ -989,8 +1201,20 @@ func (h *Harness) resolveExternalFinalization(ctx context.Context, lane *runtime
 }
 
 func (h *Harness) runBeforeRequest(ctx context.Context, fx *runtimeEffects, operation Operation, attempt int64, options *AgentHarnessStreamOptions) error {
+	return h.runBeforeRequestStep(ctx, fx, operation, attempt, "assistant", "", options)
+}
+
+func (h *Harness) runBeforeRequestStep(ctx context.Context, fx *runtimeEffects, operation Operation, attempt int64, step, turnID string, options *AgentHarnessStreamOptions) error {
+	key := fmt.Sprintf("%s:before_request:%d", operation.OperationID, attempt)
+	if step != "assistant" {
+		key = fmt.Sprintf("%s:%s:before_request:%d", operation.OperationID, step, attempt)
+	}
 	return h.effect(ctx, ActionInfo{Kind: "hook", Description: "before_request"}, func(ctx context.Context) error {
-		output, err := fx.Run(ctx, EffectPlan{Kind: EffectHook, Key: EffectKey(fmt.Sprintf("%s:before_request:%d", operation.OperationID, attempt)), HookName: HookBeforeRequest, Event: map[string]JSONValue{"step": "assistant", "attempt": attempt, "streamOptions": *options}})
+		event := map[string]JSONValue{"step": step, "attempt": attempt, "streamOptions": *options}
+		if turnID != "" {
+			event["turnId"] = turnID
+		}
+		output, err := fx.Run(ctx, EffectPlan{Kind: EffectHook, Key: EffectKey(key), HookName: HookBeforeRequest, Event: event})
 		if values, ok := output.Result.(map[string]JSONValue); ok {
 			if patch, ok := values["streamOptions"].(AgentHarnessStreamOptionsPatch); ok {
 				*options = applyStreamOptions(*options, patch)
@@ -1966,6 +2190,17 @@ func (e *runtimeEffects) Run(ctx context.Context, plan EffectPlan) (EffectOutput
 			message.Role = "assistant"
 		}
 		return EffectOutput{Kind: "assistant", Key: plan.Key, Message: message}, nil
+	case EffectDeferred:
+		if plan.Handle == nil {
+			return EffectOutput{}, fmt.Errorf("deferred effect has no handle")
+		}
+		effectCtx, stop := e.lane.cancellableEffectContext(ctx)
+		defer stop()
+		if _, err := e.harness.models.Resolve(effectCtx, plan.Model.Provider, plan.Model.ModelID); err != nil {
+			return EffectOutput{}, err
+		}
+		response, err := e.harness.models.FetchDeferred(effectCtx, plan.Model, *plan.Handle, plan.StreamOptions)
+		return EffectOutput{Kind: "deferred", Key: plan.Key, Deferred: &response}, err
 	case EffectTool:
 		effectCtx, stop := e.lane.cancellableEffectContext(ctx)
 		defer stop()
@@ -2153,6 +2388,11 @@ func (l *runtimeLane) Resume(ctx context.Context) (Result[ResumeOutcome, error],
 	}
 	if current.State.Run.Phase.Kind == PhaseAssistant && current.State.Run.Phase.Generation != nil && current.State.Run.Phase.Generation.Status != GenerationEffectPending {
 		if missing := l.missingIdentities(ctx, current.Configuration); missing != nil {
+			return Result[ResumeOutcome, error]{Err: missing}, nil
+		}
+	}
+	if current.State.Run.Phase.Kind == PhaseDeferred && current.State.Run.Phase.Deferred != nil {
+		if missing := l.missingIdentities(ctx, current.State.Run.Phase.Deferred.Configuration); missing != nil {
 			return Result[ResumeOutcome, error]{Err: missing}, nil
 		}
 	}
